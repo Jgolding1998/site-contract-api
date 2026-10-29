@@ -1,0 +1,13 @@
+{
+  "item_selector": "#catalog > article.product",
+  "min_items": 1,
+  "max_items": 20,
+  "expected_items": 3,
+  "fields": [
+    {"name": "code", "selector": ":scope", "attribute": "data-code", "required": true},
+    {"name": "name", "selector": "h2.name", "required": true},
+    {"name": "price", "selector": ".price", "attribute": "data-price", "type": "number", "required": true},
+    {"name": "stock", "selector": ".stock", "type": "integer", "required": true},
+    {"name": "details", "selector": "a.details[href]", "attribute": "href", "type": "url", "required": true}
+  ]
+}

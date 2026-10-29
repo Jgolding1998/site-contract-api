@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "site-contract-api"
+version = "1.0.0"
+description = "Static HTML to checked JSON with explicit selectors and provenance."
+requires-python = ">=3.11"
+license = "MIT"
+readme = "README.md"
+dependencies = []
+
+[project.scripts]
+site-contract-api = "site_contract_api.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["site_contract_api*"]
+
+[tool.setuptools.package-data]
+site_contract_api = ["static/*", "data/*"]
