@@ -115,6 +115,7 @@ class Server(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(32)
         self.cookie_name = f"sca_csrf_{self.server_port}"
         self.jobs = threading.BoundedSemaphore(2)
+        self.source_jobs = threading.BoundedSemaphore(1)
 
     def process_request(self, request, client_address):
         if not self.connections.acquire(blocking=False):
@@ -281,7 +282,11 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/healthz":
             self.send_json(200, {"ok": True})
         elif self.path == "/api/data":
+            if not self.server.source_jobs.acquire(blocking=False):
+                self.send_json(503, {"ok": False, "error": "busy", "message": "Configured source is busy. Try again."})
+                return
             if not self.server.jobs.acquire(blocking=False):
+                self.server.source_jobs.release()
                 self.send_json(503, {"ok": False, "error": "busy", "message": "Processing slots are busy. Try again."})
                 return
             try:
@@ -290,6 +295,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(409 if exc.code == "schema_drift" else 413 if exc.code == "output_limit" else 502, exc.as_dict())
             finally:
                 self.server.jobs.release()
+                self.server.source_jobs.release()
         else:
             self.send_json(404, {"ok": False, "error": "not_found", "message": "Route not found."})
 

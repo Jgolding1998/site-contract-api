@@ -16,6 +16,25 @@ from .test_engine import HTML, RULES
 
 
 class HTTPTests(unittest.TestCase):
+    def test_slow_configured_source_does_not_block_preview_slots(self):
+        entered, release = threading.Event(), threading.Event()
+        first = []
+        def read():
+            entered.set()
+            release.wait(6)
+            return HTML
+        self.server.source.remote = mock.Mock(read=read, url="https://example.invalid/", retrieved_at=None)
+        worker = threading.Thread(target=lambda: first.append(self.request()[0]), daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(self.request()[0], 503)
+            self.assertEqual(self.request("POST", "/api/preview", {"html": HTML, "rules": RULES})[0], 200)
+        finally:
+            release.set()
+            worker.join(3)
+        self.assertEqual(first, [200])
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.source_path = Path(self.directory.name) / "source.html"
