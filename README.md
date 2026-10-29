@@ -41,6 +41,8 @@ Types are `text`, `number`, `integer` and `url`. Fields are required by default;
 
 The exact count must fit `min_items` and `max_items`. Adjacent text and inline markup join without inserted spaces, including React comment boundaries; other elements and `<br>` separate words. Whitespace is normalized and CSS layout is not interpreted.
 
+Extraction uses scripting-enabled HTML semantics without running scripts: `script`, `style`, `template` and `noscript` content is excluded. For lazy images, select the real image's `data-src` attribute instead of a `noscript` fallback. Text-only elements need explicit start and end tags. Older Python patch levels that cannot parse text-only elements safely reject nested markup there. On parsers that corrupt ambiguous attribute references such as `&region=us`, extraction fails if a field or value-dependent selector uses that attribute; unrelated attributes are ignored. Update Python or encode attribute ampersands as `&amp;`.
+
 Supported selectors: tags, `*`, `.class`, `#id`, `[attribute]`, `[attribute=value]`, descendant ASCII whitespace and child `>`. Non-ASCII spacing characters and vertical tabs are rejected outside quoted attribute values. A standalone `:scope` selects the item itself. Selector groups, pseudo-classes and JavaScript are unsupported. Write optional closing tags such as `</td>`, `</p>` and `</li>` explicitly; ambiguous omissions and nested links are rejected. The parser expects reasonably well-formed static HTML; it is not a browser DOM implementation.
 
 Successful responses include typed items, a source hash, a rules hash, selectors and the capture time. Contract failures return named issues and no partial items. `/api/data` returns HTTP 409 for a failed contract.

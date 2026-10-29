@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+from html.entities import html5
 from html.parser import HTMLParser
+import html.parser as html_parser
 import json
 import math
 import re
@@ -20,7 +22,8 @@ MAX_VALUE = 2048
 MAX_WORK = 500_000
 MAX_OUTPUT = 3 * 1024 * 1024
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
-HIDDEN = {"script", "style", "template"}
+HIDDEN = {"script", "style", "template", "noscript"}
+TEXT_ONLY = {"script", "style", "textarea", "title", "noscript", "xmp", "iframe", "noembed", "noframes"}
 OPTIONAL_END = {"p", "li", "dt", "dd", "td", "th", "tr", "thead", "tbody", "tfoot", "option", "optgroup", "colgroup"}
 P_BLOCKS = set("address article aside blockquote details dialog div dl fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre search section table ul li dt dd tr td th".split())
 IMPLIED_BOUNDARIES = {"li": ({"li"}, {"ul", "ol"}), "dt": ({"dt", "dd"}, {"dl"}),
@@ -31,6 +34,50 @@ LINK_SCOPES = {"td", "th", "caption", "template", "object", "applet", "marquee"}
 INLINE = set("a abbr acronym b bdi bdo big cite code data del dfn em font i img ins kbd label mark nobr q rb rp rt ruby s samp small span strike strong sub sup time tt u var wbr".split())
 ASCII_SPACE = r"[\t\n\f\r ]+"
 IDENT = r"[A-Za-z_][A-Za-z0-9_-]*"
+
+
+def _needs_attribute_guard():
+    class Probe(HTMLParser):
+        value = None
+
+        def handle_starttag(self, tag, attrs):
+            self.value = dict(attrs).get("href")
+
+    parser = Probe()
+    parser.feed('<a href="?a&notx=1&not=2">')
+    parser.close()
+    return parser.value != "?a&notx=1&not=2"
+
+
+_ATTRIBUTE_GUARD = _needs_attribute_guard()
+_AMBIGUOUS_ATTRIBUTE_REF = re.compile(r"&(?:" + "|".join(re.escape(name) for name in
+    sorted((name for name in html5 if not name.endswith(";")), key=len, reverse=True)) + r")(?=[=A-Za-z0-9])")
+_NAMED_REF = re.compile(r"&[A-Za-z][A-Za-z0-9]*;?")
+
+
+def _ambiguous_reference(value):
+    return any(not (ref.group().endswith(";") and ref.group()[1:] in html5)
+               and _AMBIGUOUS_ATTRIBUTE_REF.match(value, ref.start()) for ref in _NAMED_REF.finditer(value))
+
+
+def _ambiguous_attributes(raw):
+    if not _ATTRIBUTE_GUARD or not raw or "&" not in raw:
+        return frozenset()
+    # Use this interpreter's own attribute token boundaries. These private
+    # patterns are optional: an unfamiliar parser fails closed on risky tags.
+    tag_pattern = getattr(html_parser, "tagfind_tolerant", None)
+    attr_pattern = getattr(html_parser, "attrfind_tolerant", None)
+    start = tag_pattern.match(raw, 1) if tag_pattern else None
+    if not start or not attr_pattern:
+        if _ambiguous_reference(raw):
+            raise ContractError("html", "This Python HTML parser cannot safely read ambiguous attribute references. Update Python or encode attribute ampersands as &amp;.")
+        return frozenset()
+    risky, position = set(), start.end()
+    while match := attr_pattern.match(raw, position):
+        if _ambiguous_reference(match.group(3) or ""):
+            risky.add(match.group(1).lower())
+        position = match.end()
+    return frozenset(risky)
 
 
 class ContractError(ValueError):
@@ -57,6 +104,7 @@ class Node:
     attrs: dict[str, str]
     parent: Node | None = None
     children: list[Node | str] = field(default_factory=list)
+    ambiguous_attrs: frozenset[str] = frozenset()
     classes: frozenset[str] = field(init=False)
 
     def __post_init__(self):
@@ -65,12 +113,19 @@ class Node:
 
 class Document(HTMLParser):
     def __init__(self):
-        super().__init__(convert_charrefs=True)
+        try:
+            super().__init__(convert_charrefs=True, scripting=True)
+        except TypeError:
+            # Older Python patch levels lack scripting/RCDATA support. Refuse
+            # nested markup callbacks there rather than fabricate child fields.
+            super().__init__(convert_charrefs=True)
         self.root = Node("document", {})
         self.stack = [self.root]
         self.nodes = 0
 
     def handle_starttag(self, tag, attrs):
+        self._guard_text_only()
+        ambiguous = _ambiguous_attributes(self.get_starttag_text())
         if tag in P_BLOCKS and any(node.tag == "p" for node in self.stack):
             raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
         if tag in IMPLIED_BOUNDARIES:
@@ -93,23 +148,43 @@ class Document(HTMLParser):
             raise ContractError("html_limit", "An HTML attribute exceeds the size limit.")
         if len({key for key, _ in attrs}) != len(attrs):
             raise ContractError("html", "Duplicate HTML attributes are ambiguous.")
-        node = Node(tag, dict((key, value or "") for key, value in attrs), self.stack[-1])
+        node = Node(tag, dict((key, value or "") for key, value in attrs), self.stack[-1], ambiguous_attrs=ambiguous)
         self.stack[-1].children.append(node)
         if tag not in VOID:
             self.stack.append(node)
 
     def handle_startendtag(self, tag, attrs):
+        if tag in TEXT_ONLY:
+            raise ContractError("html", "Text-only HTML elements need explicit start and end tags.")
         self.handle_starttag(tag, attrs)
         if tag not in VOID:
             self.stack.pop()
 
     def handle_endtag(self, tag):
+        if self.stack[-1].tag != tag:
+            self._guard_text_only()
         for index in range(len(self.stack) - 1, 0, -1):
             if self.stack[index].tag == tag:
                 if any(node.tag in OPTIONAL_END for node in self.stack[index + 1:]):
                     raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
                 del self.stack[index:]
                 break
+
+    def _guard_text_only(self):
+        if self.stack[-1].tag in TEXT_ONLY:
+            raise ContractError("html", "This Python HTML parser cannot safely read markup inside a text-only element. Update Python or use a simpler capture.")
+
+    def handle_comment(self, data):
+        self._guard_text_only()
+
+    def handle_decl(self, decl):
+        self._guard_text_only()
+
+    def handle_pi(self, data):
+        self._guard_text_only()
+
+    def unknown_decl(self, data):
+        self._guard_text_only()
 
     def close(self):
         super().close()
@@ -129,6 +204,13 @@ class Simple:
     attrs: tuple[tuple[str, str | None], ...] = ()
 
     def matches(self, node: Node) -> bool:
+        if self.tag != "*" and self.tag != node.tag:
+            return False
+        if node.ambiguous_attrs:
+            used = ({"id"} if self.identifier is not None else set()) | ({"class"} if self.classes else set())
+            used.update(key for key, value in self.attrs if value is not None)
+            if node.ambiguous_attrs.intersection(used):
+                raise ContractError("html", "A selector uses an attribute this Python HTML parser may change. Update Python or encode attribute ampersands as &amp;.")
         return ((self.tag == "*" or self.tag == node.tag)
                 and (self.identifier is None or node.attrs.get("id") == self.identifier)
                 and all(name in node.classes for name in self.classes)
@@ -218,6 +300,7 @@ def _query(scope: Node, steps: tuple[tuple[Simple, str], ...], budget=None) -> l
     if not steps:
         return [scope]
     output, pending, memo = [], list(reversed([c for c in scope.children if isinstance(c, Node)])), {}
+    single = steps[0][0] if len(steps) == 1 else None
 
     def matches(current, index):
         if current is None or current is scope.parent:
@@ -249,7 +332,14 @@ def _query(scope: Node, steps: tuple[tuple[Simple, str], ...], budget=None) -> l
         if node.tag in HIDDEN:
             continue
         pending.extend(reversed([c for c in node.children if isinstance(c, Node)]))
-        if matches(node, len(steps) - 1):
+        if single is not None:
+            # One step needs no ancestor recursion or per-node memo entry. Keep
+            # the same work charge as the general matcher.
+            work(budget)
+            matched = single.matches(node)
+        else:
+            matched = matches(node, len(steps) - 1)
+        if matched:
             output.append(node)
     return output
 
@@ -390,6 +480,8 @@ def extract(html: str, rules: dict | str, *, source_kind="pasted", source_url: s
                 continue
             raw = ""
             if len(matches) == 1:
+                if spec.get("attribute") in matches[0].ambiguous_attrs:
+                    raise ContractError("html", "A field uses an attribute this Python HTML parser may change. Update Python or encode attribute ampersands as &amp;.")
                 raw = matches[0].attrs.get(spec["attribute"], "") if spec.get("attribute") else node_text(matches[0], budget)
                 raw = raw.strip()
             if not matches or not raw:

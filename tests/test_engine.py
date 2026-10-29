@@ -13,6 +13,98 @@ RULES = json.loads((DATA / "rules.json").read_text())
 
 
 class EngineTests(unittest.TestCase):
+    def test_noscript_fallback_is_not_a_field_or_visible_text(self):
+        rules = {"item_selector": "article", "fields": [{"name": "price", "selector": ".price", "type": "number"}]}
+        with self.assertRaises(engine.ContractError) as caught:
+            engine.extract('<article><noscript><span class="price">0</span></noscript></article>', rules)
+        self.assertEqual(caught.exception.code, "schema_drift")
+        self.assertEqual(caught.exception.issues[0]["code"], "missing_required")
+        rules["fields"] = [{"name": "title", "selector": ":scope"}]
+        self.assertEqual(engine.extract('<article>Ready<noscript>Enable scripts</noscript></article>', rules)["items"], [{"title": "Ready"}])
+
+    def test_noscript_lazy_image_does_not_duplicate_real_image(self):
+        html = '<article><img class="photo" data-src="/actual.png"><noscript><img class="photo" src="/fallback.png"></noscript></article>'
+        rules = {"item_selector": "article", "fields": [{"name": "photo", "selector": ".photo", "attribute": "data-src", "type": "url"}]}
+        self.assertEqual(engine.extract(html, rules)["items"], [{"photo": "https://example.invalid/actual.png"}])
+
+    def test_legacy_raw_text_callbacks_fail_closed(self):
+        # Simulate callback sequences on older supported HTMLParser patch levels.
+        # Current parsers return these contents as data instead of child tags.
+        for tag in ("textarea", "title", "noscript", "xmp", "iframe", "noembed", "noframes"):
+            for callback in (lambda p: p.handle_starttag("span", [("class", "price")]),
+                             lambda p: p.handle_startendtag("img", []),
+                             lambda p: p.handle_endtag("article"),
+                             lambda p: p.handle_comment("literal comment"),
+                             lambda p: p.handle_decl("doctype html"),
+                             lambda p: p.handle_pi("literal"),
+                             lambda p: p.unknown_decl("CDATA[literal")):
+                with self.subTest(tag=tag, callback=callback):
+                    parser = engine.Document()
+                    parser.handle_starttag(tag, [])
+                    with self.assertRaises(engine.ContractError) as caught:
+                        callback(parser)
+                    self.assertEqual(caught.exception.code, "html")
+        parser = engine.Document()
+        parser.handle_starttag("textarea", [])
+        parser.handle_data("plain text")
+        parser.handle_endtag("textarea")
+        self.assertEqual(engine.node_text(parser.root), "plain text")
+
+    def test_modern_rcdata_keeps_literal_markup(self):
+        if not getattr(engine.HTMLParser, "RCDATA_CONTENT_ELEMENTS", None):
+            self.skipTest("This Python parser predates RCDATA handling; markup is rejected instead")
+        rules = {"item_selector": "article", "fields": [{"name": "value", "selector": "textarea"}]}
+        html = '<article><textarea><span class="price">0</span><!-- literal --> &amp;</textarea></article>'
+        self.assertEqual(engine.extract(html, rules)["items"], [{"value": '<span class="price">0</span><!-- literal --> &'}])
+
+    def test_attribute_references_never_silently_change_query_parameters(self):
+        rules = {"item_selector": "article", "fields": [{"name": "url", "selector": "a", "attribute": "href", "type": "url"}]}
+        for value in ("/p?id=1&region=us", "/p?id=1&currency=EUR", "/p?a=1&not=x"):
+            with self.subTest(value=value):
+                try:
+                    result = engine.extract(f'<article><a href="{value}">x</a></article>', rules)
+                except engine.ContractError as error:
+                    self.assertEqual(error.code, "html")
+                else:
+                    self.assertEqual(result["items"], [{"url": "https://example.invalid" + value}])
+        for value, expected in (("/p?a=1&page=2", "/p?a=1&page=2"), ("/p?a=1&amp;b=2", "/p?a=1&b=2"), ("/p?x=&copy;=2", "/p?x=\u00a9=2")):
+            self.assertEqual(engine.extract(f'<article><a href="{value}">x</a></article>', rules)["items"], [{"url": "https://example.invalid" + expected}])
+
+    def test_legacy_attribute_guard_is_narrow(self):
+        rules = {"item_selector": "article", "fields": [{"name": "value", "selector": "span", "attribute": "data-value"}]}
+        with mock.patch.object(engine, "_ATTRIBUTE_GUARD", True):
+            for value in ("A&para1", "&ampx", "x&reg=us"):
+                with self.subTest(value=value), self.assertRaises(engine.ContractError) as caught:
+                    engine.extract(f'<article><span data-value="{value}"></span></article>', rules)
+                self.assertEqual(caught.exception.code, "html")
+            for value, expected in (("R&D", "R&D"), ("&page=2", "&page=2"), ("&amp;x", "&x"), ("&copy;=2", "\u00a9=2"), ("&notin;", "\u2209"), ("&parallel;", "\u2225")):
+                self.assertEqual(engine.extract(f'<article><span data-value="{value}"></span></article>', rules)["items"], [{"value": expected}])
+
+    def test_legacy_attribute_taint_does_not_reject_unread_attributes(self):
+        html = '<link href="/a.css?v=1&timestamp=9"><img src="/pixel?id=1&param=x"><article class="product" data-note="&region=us"><span class="title">Ready</span></article>'
+        rules = {"item_selector": "article.product", "fields": [{"name": "title", "selector": ".title"}]}
+        with mock.patch.object(engine, "_ATTRIBUTE_GUARD", True):
+            self.assertEqual(engine.extract(html, rules)["items"], [{"title": "Ready"}])
+            # Existence selectors do not depend on the decoded value.
+            rules["item_selector"] = 'article[data-note]'
+            self.assertEqual(engine.extract(html, rules)["items"], [{"title": "Ready"}])
+            rules["item_selector"] = 'article[data-note="&region=us"]'
+            with self.assertRaises(engine.ContractError) as caught:
+                engine.extract(html, rules)
+            self.assertEqual(caught.exception.code, "html")
+            for attribute, selector in (("class", ".product"), ("id", "#product")):
+                rules["item_selector"] = selector
+                with self.assertRaises(engine.ContractError) as caught:
+                    engine.extract(f'<article {attribute}="product &region=us"><span class="title">Ready</span></article>', rules)
+                self.assertEqual(caught.exception.code, "html")
+
+    def test_self_closing_text_only_elements_are_rejected(self):
+        rules = {"item_selector": "article", "fields": [{"name": "price", "selector": ".price", "type": "number"}]}
+        for tag in engine.TEXT_ONLY:
+            with self.subTest(tag=tag), self.assertRaises(engine.ContractError) as caught:
+                engine.extract(f'<article><{tag}/><span class="price">5</span></{tag}></article>', rules)
+            self.assertEqual(caught.exception.code, "html")
+
     def test_selector_combinators_use_css_whitespace_only(self):
         html = '<article><div class="wrapper"><span class="price">24.50</span></div></article>'
         rules = {"item_selector": "article", "fields": [{"name": "price", "selector": ".wrapper .price", "type": "number"}]}
