@@ -129,6 +129,26 @@ class HTTPTests(unittest.TestCase):
             with self.subTest(headers=list(headers)):
                 self.assertEqual(self.request("POST", "/api/preview", body, headers)[0], 403)
 
+    def test_cross_origin_signals_are_rejected_for_every_method_before_source_reads(self):
+        port = self.server.server_port
+        foreign = [{"Origin": "null"}, {"Origin": "https://attacker.invalid"}, {"Origin": "http://127.0.0.1:1"},
+                   {"Origin": f"http://localhost:{port}"}, {"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"}]
+        with mock.patch.object(self.server.source, "result") as result:
+            for method, path in (("GET", "/api/data"), ("GET", "/"), ("GET", "/static/app.js"), ("GET", "/api/demo"), ("OPTIONS", "/api/data")):
+                for headers in foreign:
+                    with self.subTest(method=method, path=path, headers=headers):
+                        status, response_headers, body = self.request(method, path, headers=headers)
+                        self.assertEqual(status, 403)
+                        self.assertEqual(json.loads(body)["error"], "origin")
+                        self.assertNotIn("Set-Cookie", response_headers)
+            result.assert_not_called()
+        allowed = [{}, {"Sec-Fetch-Site": "none"}, {"Sec-Fetch-Site": "same-origin", "Origin": "http://" + self.host},
+                   {"Host": f"localhost:{port}", "Origin": f"http://LOCALHOST:{port}", "Sec-Fetch-Site": "same-origin"}]
+        for headers in allowed:
+            with self.subTest(allowed=headers):
+                self.assertEqual(self.request(path="/api/data", headers=headers)[0], 200)
+                self.assertEqual(self.request(path="/", headers=headers)[0], 200)
+
     def test_unknown_hosts_and_arbitrary_fetch_parameters_fail(self):
         with mock.patch("site_contract_api.remote.bounded_get") as fetch:
             for host in ("evil.example", "localhost", "127.0.0.1.evil.example", self.host + ".example"):
@@ -139,7 +159,7 @@ class HTTPTests(unittest.TestCase):
             fetch.assert_not_called()
 
     def test_duplicate_headers_and_transfer_encoding_fail(self):
-        for name, value in (("Host", self.host), ("Origin", "http://" + self.host), ("Content-Length", "0"), ("Content-Type", "application/json")):
+        for name, value in (("Host", self.host), ("Origin", "http://" + self.host), ("Content-Length", "0"), ("Content-Type", "application/json"), ("Sec-Fetch-Site", "same-origin")):
             connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
             connection.putrequest("GET", "/healthz", skip_host=True)
             if name != "Host":

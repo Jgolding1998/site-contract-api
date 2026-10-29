@@ -37,7 +37,7 @@ python -m site_contract_api serve --source page.html --rules rules.json
 
 Types are `text`, `number`, `integer` and `url`. Fields are required by default; an absent optional field becomes `null`. `expected_items` can enforce an exact count. `base_url` resolves relative links without fetching anything; without it, local previews use `https://example.invalid/`.
 
-Supported selectors: tags, `*`, `.class`, `#id`, `[attribute]`, `[attribute=value]`, descendant spaces and child `>`. A standalone `:scope` selects the item itself. Selector groups, pseudo-classes and JavaScript are unsupported. Write optional closing tags such as `</td>`, `</p>` and `</li>` explicitly; ambiguous omissions are rejected. The parser expects reasonably well-formed static HTML; it is not a browser DOM implementation.
+Supported selectors: tags, `*`, `.class`, `#id`, `[attribute]`, `[attribute=value]`, descendant spaces and child `>`. A standalone `:scope` selects the item itself. Selector groups, pseudo-classes and JavaScript are unsupported. Write optional closing tags such as `</td>`, `</p>` and `</li>` explicitly; ambiguous omissions and nested links are rejected. The parser expects reasonably well-formed static HTML; it is not a browser DOM implementation.
 
 Successful responses include typed items, a source hash, a rules hash, selectors and the capture time. Contract failures return named issues and no partial items. `/api/data` returns HTTP 409 for a failed contract.
 
@@ -51,7 +51,7 @@ Remote reads must be configured in the CLI. There is no browser URL-fetch endpoi
 python -m site_contract_api serve --remote-url https://example.org/catalog --allow-host example.org --rules rules.json
 ```
 
-Use only a source you are allowed to access. The client checks robots.txt, identifies itself as `SiteContractAPI/1.0`, caches refreshes for at least 60 seconds, validates every resolved address and pins the connection while verifying the original TLS hostname. Redirects, proxies, private destinations, credentials, query strings and compressed responses are unsupported. robots.txt failures stop the read; a missing robots.txt returns standard 404 handling. Long crawl delays require a local capture instead.
+Use only a source you are allowed to access. The client checks robots.txt, identifies itself as `SiteContractAPI/1.0`, caches refreshes for at least 60 seconds, validates every resolved address and pins the connection while verifying the original TLS hostname. Redirects, proxies, private destinations, credentials, query strings, dot segments, unencoded non-ASCII paths and compressed responses are unsupported. robots.txt failures stop the read; a missing robots.txt returns standard 404 handling. Long crawl delays require a local capture instead.
 
 ## Checks and limits
 

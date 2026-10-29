@@ -27,6 +27,7 @@ IMPLIED_BOUNDARIES = {"li": ({"li"}, {"ul", "ol"}), "dt": ({"dt", "dd"}, {"dl"})
                       "dd": ({"dt", "dd"}, {"dl"}), "td": ({"td", "th"}, {"tr", "table"}),
                       "th": ({"td", "th"}, {"tr", "table"}), "tr": ({"tr"}, {"table", "tbody", "thead", "tfoot"}),
                       "option": ({"option"}, {"select", "datalist"}), "optgroup": ({"option", "optgroup"}, {"select"})}
+LINK_SCOPES = {"td", "th", "caption", "template", "object", "applet", "marquee"}
 IDENT = r"[A-Za-z_][A-Za-z0-9_-]*"
 
 
@@ -77,6 +78,12 @@ class Document(HTMLParser):
                     break
                 if node.tag in previous:
                     raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
+        if tag == "a":
+            for node in reversed(self.stack):
+                if node.tag in LINK_SCOPES:
+                    break
+                if node.tag == "a":
+                    raise ContractError("html", "Close each link before starting another; browsers split nested links.")
         self.nodes += 1
         if self.nodes > MAX_NODES or len(self.stack) > MAX_DEPTH or len(attrs) > 32:
             raise ContractError("html_limit", "HTML structure exceeds the node, depth or attribute limit.")

@@ -192,13 +192,18 @@ class Handler(BaseHTTPRequestHandler):
         if len(self.headers) > 32 or sum(len(k) + len(v) for k, v in self.headers.items()) > 8192:
             self.send_json(431, {"ok": False, "error": "headers", "message": "Request headers exceed the limit."})
             return False
-        if self.headers.get("Transfer-Encoding") is not None or any(len(self.headers.get_all(name, [])) > 1 for name in ("Host", "Origin", "Content-Length", "Content-Type", "Cookie", "X-CSRF-Token")):
+        if self.headers.get("Transfer-Encoding") is not None or any(len(self.headers.get_all(name, [])) > 1 for name in ("Host", "Origin", "Content-Length", "Content-Type", "Cookie", "X-CSRF-Token", "Sec-Fetch-Site")):
             self.send_json(400, {"ok": False, "error": "headers", "message": "Ambiguous request headers."})
             return False
         expected = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
         host = self.headers.get("Host", "").lower()
         if host not in expected:
             self.send_json(400, {"ok": False, "error": "host", "message": "Host not allowed."})
+            return False
+        origin = self.headers.get("Origin")
+        if ((origin is not None and origin.lower() != "http://" + host)
+                or self.headers.get("Sec-Fetch-Site", "same-origin") not in {"same-origin", "none"}):
+            self.send_json(403, {"ok": False, "error": "origin", "message": "Cross-origin requests are not accepted. Open this page directly."})
             return False
         if "?" in self.path or "#" in self.path:
             self.send_json(400, {"ok": False, "error": "parameters", "message": "This service does not accept URL parameters."})

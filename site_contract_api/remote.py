@@ -10,7 +10,7 @@ import queue
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from urllib.robotparser import RobotFileParser
 
 from .engine import ContractError, MAX_HTML
@@ -38,10 +38,13 @@ def validate_target(url: str, allow_host: str) -> tuple[str, str]:
                 or parts.password is not None or parts.query or parts.fragment or len(url) > 2048
                 or any(char.isspace() or ord(char) < 32 for char in url) or "\\" in url or "%" in host):
             raise ValueError()
-        host.encode("ascii")
-        return host, parts.path or "/"
+        path = parts.path or "/"
+        if any(segment in {".", ".."} for segment in unquote(path).split("/")):
+            raise ValueError()
+        (host + path).encode("ascii")
+        return host, path
     except (ValueError, UnicodeError, TypeError) as exc:
-        raise RemoteError("remote_target", "Use an HTTPS URL with an exact lowercase --allow-host, port 443 and no credentials, query or fragment.") from exc
+        raise RemoteError("remote_target", "Use an HTTPS URL with an exact lowercase --allow-host, port 443, an ASCII path without dot segments and no credentials, query or fragment.") from exc
 
 
 def public_addresses(host: str) -> list[str]:

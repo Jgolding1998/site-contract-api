@@ -56,6 +56,16 @@ class EngineRegressionTests(unittest.TestCase):
                                 {"item_selector": "li", "fields": [{"name": "title", "selector": ":scope"}]})
         self.assertEqual([row["title"] for row in result["items"]], ["Outer Inner", "Inner"])
 
+    def test_nested_links_fail_instead_of_merging_text(self):
+        rules = {"item_selector": "li.row", "fields": [{"name": "label", "selector": "a.first"}]}
+        with self.assertRaises(engine.ContractError) as caught:
+            engine.extract('<ul><li class="row"><a class="first" href="/a">One<a class="second" href="/b">Two</a></li></ul>', rules)
+        self.assertEqual(caught.exception.code, "html")
+        result = engine.extract('<ul><li class="row"><a class="first" href="/a">One</a><a href="/b">Two</a></li></ul>', rules)
+        self.assertEqual(result["items"], [{"label": "One"}])
+        cell = '<a class="first" href="/a">Outer<table><tr><td><a href="/b">Cell</a></td></tr></table></a>'
+        self.assertEqual(engine.extract(f'<ul><li class="row">{cell}</li></ul>', rules)["items"], [{"label": "Outer Cell"}])
+
     def test_cli_json_works_with_a_windows_legacy_output_encoding(self):
         with tempfile.TemporaryDirectory() as directory:
             source, rules = Path(directory) / "page.html", Path(directory) / "rules.json"
@@ -84,6 +94,17 @@ class RemoteRegressionTests(unittest.TestCase):
                     fetch.assert_called_once()
                     sleep.assert_not_called()
                 self.assertEqual(source.last_error[0], "robots_invalid")
+
+    def test_targets_that_robots_cannot_check_are_rejected_before_any_request(self):
+        policy = b"User-agent: *\nDisallow: /private\n"
+        for url in ("https://example.invalid/public/../private/data", "https://example.invalid/public/%2e%2E/private/data",
+                    "https://example.invalid/./private", "https://example.invalid/café"):
+            with self.subTest(url=ascii(url)), mock.patch.object(remote, "bounded_get", return_value=(200, policy, "text/plain")) as fetch:
+                with self.assertRaises(remote.RemoteError) as error:
+                    remote.RemoteSource(url, "example.invalid")
+                self.assertEqual(error.exception.code, "remote_target")
+                fetch.assert_not_called()
+        self.assertEqual(remote.validate_target("https://example.invalid/caf%C3%A9/.well-known", "example.invalid")[1], "/caf%C3%A9/.well-known")
 
     def test_cached_errors_do_not_retain_or_grow_exception_tracebacks(self):
         source = remote.RemoteSource("https://example.invalid/catalog", "example.invalid")
