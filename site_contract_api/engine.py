@@ -31,6 +31,7 @@ IMPLIED_BOUNDARIES = {"li": ({"li"}, {"ul", "ol"}), "dt": ({"dt", "dd"}, {"dl"})
                       "th": ({"td", "th"}, {"tr", "table"}), "tr": ({"tr"}, {"table", "tbody", "thead", "tfoot"}),
                       "option": ({"option"}, {"select", "datalist"}), "optgroup": ({"option", "optgroup"}, {"select"})}
 LINK_SCOPES = {"td", "th", "caption", "template", "object", "applet", "marquee"}
+FOREIGN_BREAKOUT = set("b big blockquote body br center code dd div dl dt em embed h1 h2 h3 h4 h5 h6 head hr i img li listing menu meta nobr ol p pre ruby s small span strong strike sub sup table tt u ul var".split())
 INLINE = set("a abbr acronym b bdi bdo big cite code data del dfn em font i img ins kbd label mark nobr q rb rp rt ruby s samp small span strike strong sub sup time tt u var wbr".split())
 ASCII_SPACE = r"[\t\n\f\r ]+"
 IDENT = r"[A-Za-z_][A-Za-z0-9_-]*"
@@ -106,6 +107,8 @@ class Node:
     children: list[Node | str] = field(default_factory=list)
     ambiguous_attrs: frozenset[str] = frozenset()
     classes: frozenset[str] = field(init=False)
+    namespace: str = "html"
+    elements: list[Node] = field(default_factory=list)
 
     def __post_init__(self):
         self.classes = frozenset(filter(None, re.split(ASCII_SPACE, self.attrs.get("class", ""))))
@@ -123,20 +126,46 @@ class Document(HTMLParser):
         self.stack = [self.root]
         self.nodes = 0
 
+    def _namespace(self, tag):
+        parent = self.stack[-1]
+        namespace = parent.namespace
+        if namespace == "svg" and parent.tag in {"foreignobject", "desc", "title"}:
+            namespace = "html"
+        elif namespace == "math":
+            if (parent.tag in {"mi", "mo", "mn", "ms", "mtext"} and tag not in {"mglyph", "malignmark"}
+                    or parent.tag == "annotation-xml" and parent.attrs.get("encoding", "").lower() in {"text/html", "application/xhtml+xml"}):
+                namespace = "html"
+            elif parent.tag == "annotation-xml" and tag == "svg":
+                return "svg"
+        if namespace == "html" and tag in {"svg", "math"}:
+            return tag
+        return namespace
+
     def handle_starttag(self, tag, attrs):
         self._guard_text_only()
         ambiguous = _ambiguous_attributes(self.get_starttag_text())
-        if tag in P_BLOCKS and any(node.tag == "p" for node in self.stack):
-            raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
-        if tag in IMPLIED_BOUNDARIES:
-            previous, containers = IMPLIED_BOUNDARIES[tag]
+        namespace = self._namespace(tag)
+        if namespace != "html" and (tag in FOREIGN_BREAKOUT or tag == "font" and any(key in {"color", "face", "size"} for key, _ in attrs)):
+            raise ContractError("html", "HTML elements inside foreign markup need explicit supported integration points.")
+        html_stack = []
+        if namespace == "html":
             for node in reversed(self.stack):
+                if node.namespace != "html":
+                    break
+                html_stack.append(node)
+        if namespace == "html" and tag in P_BLOCKS and any(node.tag == "p" for node in html_stack):
+            raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
+        if namespace == "html" and tag in IMPLIED_BOUNDARIES:
+            previous, containers = IMPLIED_BOUNDARIES[tag]
+            for node in html_stack:
                 if node.tag in containers:
                     break
                 if node.tag in previous:
                     raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
-        if tag == "a":
+        if namespace == "html" and tag == "a":
             for node in reversed(self.stack):
+                if node.namespace != "html":
+                    continue
                 if node.tag in LINK_SCOPES:
                     break
                 if node.tag == "a":
@@ -148,16 +177,20 @@ class Document(HTMLParser):
             raise ContractError("html_limit", "An HTML attribute exceeds the size limit.")
         if len({key for key, _ in attrs}) != len(attrs):
             raise ContractError("html", "Duplicate HTML attributes are ambiguous.")
-        node = Node(tag, dict((key, value or "") for key, value in attrs), self.stack[-1], ambiguous_attrs=ambiguous)
+        node = Node(tag, dict((key, value or "") for key, value in attrs), self.stack[-1], ambiguous_attrs=ambiguous, namespace=namespace)
         self.stack[-1].children.append(node)
-        if tag not in VOID:
+        self.stack[-1].elements.append(node)
+        if namespace != "html" or tag not in VOID:
             self.stack.append(node)
 
     def handle_startendtag(self, tag, attrs):
-        if tag in TEXT_ONLY:
-            raise ContractError("html", "Text-only HTML elements need explicit start and end tags.")
+        namespace = self._namespace(tag)
+        if namespace == "html" and tag not in VOID:
+            if tag in TEXT_ONLY:
+                raise ContractError("html", "Text-only HTML elements need explicit start and end tags.")
+            raise ContractError("html", "Non-void HTML elements need explicit start and end tags.")
         self.handle_starttag(tag, attrs)
-        if tag not in VOID:
+        if namespace != "html" or tag not in VOID:
             self.stack.pop()
 
     def handle_endtag(self, tag):
@@ -299,7 +332,7 @@ def _query(scope: Node, steps: tuple[tuple[Simple, str], ...], budget=None) -> l
     budget = budget if budget is not None else [MAX_WORK]
     if not steps:
         return [scope]
-    output, pending, memo = [], list(reversed([c for c in scope.children if isinstance(c, Node)])), {}
+    output, pending, memo = [], list(reversed(scope.elements)), {}
     single = steps[0][0] if len(steps) == 1 else None
 
     def matches(current, index):
@@ -331,7 +364,7 @@ def _query(scope: Node, steps: tuple[tuple[Simple, str], ...], budget=None) -> l
         node = pending.pop()
         if node.tag in HIDDEN:
             continue
-        pending.extend(reversed([c for c in node.children if isinstance(c, Node)]))
+        pending.extend(reversed(node.elements))
         if single is not None:
             # One step needs no ancestor recursion or per-node memo entry. Keep
             # the same work charge as the general matcher.

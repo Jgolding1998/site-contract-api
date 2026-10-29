@@ -21,6 +21,84 @@ def supports_scripting_parser():
 
 
 class EngineTests(unittest.TestCase):
+    def test_nested_html_links_across_foreign_integration_points_are_rejected(self):
+        rules = {"item_selector": "article", "fields": [{"name": "name", "selector": "a.outer"}]}
+        html = '<article><a class="outer"><svg><foreignObject><a>Two</a></foreignObject></svg>Widget</a></article>'
+        with self.assertRaises(engine.ContractError) as caught:
+            engine.extract(html, rules)
+        self.assertEqual(caught.exception.code, "html")
+        for content in ('<svg><a href="#icon"><path/></a></svg>Widget',
+                        '<svg><foreignObject><span>Two</span></foreignObject></svg>Widget',
+                        '<table><tr><td><a>Two</a></td></tr></table>Widget'):
+            value = engine.extract('<article><a class="outer">' + content + '</a></article>', rules)
+            self.assertTrue(value["ok"])
+            self.assertIn("Widget", value["items"][0]["name"])
+
+    def test_html_void_names_in_foreign_content_keep_their_children(self):
+        for namespace, child in (("svg", "g"), ("math", "mrow")):
+            html = f'<{namespace}><input><{child}>value</{child}></input></{namespace}>'
+            rules = {"item_selector": "input > " + child, "fields": [{"name": "name", "selector": ":scope"}]}
+            with self.subTest(namespace=namespace):
+                self.assertEqual(engine.extract(html, rules)["items"], [{"name": "value"}])
+                rules.update(item_selector=namespace + " > " + child, min_items=0)
+                self.assertEqual(engine.extract(html, rules)["items"], [])
+
+    def test_self_closed_foreign_void_names_do_not_capture_following_siblings(self):
+        for namespace, child in (("svg", "g"), ("math", "mrow")):
+            html = f'<{namespace}><input/><{child}>value</{child}></{namespace}>'
+            rules = {"item_selector": namespace + " > " + child, "fields": [{"name": "name", "selector": ":scope"}]}
+            self.assertEqual(engine.extract(html, rules)["items"], [{"name": "value"}])
+
+    def test_nonvoid_html_self_closing_tags_fail_without_fabricated_fields(self):
+        rules = {"item_selector": "article", "fields": [{"name": "name", "selector": "article > .name"}]}
+        for tag in ("div", "span", "x-box", "p", "li", "a"):
+            html = '<article><' + tag + '/><span class="name">Alpha</span></' + tag + '></article>'
+            with self.subTest(tag=tag), self.assertRaises(engine.ContractError) as caught:
+                engine.extract(html, rules)
+            self.assertEqual(caught.exception.code, "html")
+            self.assertNotIn("items", caught.exception.as_dict())
+
+    def test_self_closing_foreign_roots_and_logo_elements_remain_usable(self):
+        rules = {"item_selector": "article", "fields": [{"name": "name", "selector": ".name"}]}
+        for logo in ('<svg><path d="M0 0"/></svg>', '<svg/>', '<math/>',
+                     '<math><mi/></math>', '<svg><title/></svg>',
+                     '<svg><foreignObject><svg><path/></svg></foreignObject></svg>',
+                     '<svg><a href="#icon"><path/></a></svg>'):
+            with self.subTest(logo=logo):
+                html = '<article><a>' + logo + '</a><span class="name">Alpha</span></article>'
+                self.assertEqual(engine.extract(html, rules)["items"], [{"name": "Alpha"}])
+
+    def test_html_integration_points_do_not_allow_self_closing_html_children(self):
+        rules = {"item_selector": "article", "fields": [{"name": "name", "selector": ".name"}]}
+        for opening, closing in [('<svg><foreignObject>', '</foreignObject></svg>'),
+                                 ('<svg><desc>', '</desc></svg>'),
+                                 ('<math><mtext>', '</mtext></math>'),
+                                 ('<math><annotation-xml encoding="text/html">', '</annotation-xml></math>')]:
+            html = '<article>' + opening + '<div/><span class="name">Alpha</span></div>' + closing + '</article>'
+            with self.subTest(opening=opening), self.assertRaises(engine.ContractError) as caught:
+                engine.extract(html, rules)
+            self.assertEqual(caught.exception.code, "html")
+
+    def test_void_and_explicit_html_controls_still_extract(self):
+        rules = {"item_selector": "article", "fields": [{"name": "name", "selector": ".name"}]}
+        for prefix in ('<img/>', '<br/>', '<div></div>', '<x-box></x-box>'):
+            self.assertEqual(engine.extract('<article>' + prefix + '<span class="name">Alpha</span></article>', rules)["items"], [{"name": "Alpha"}])
+
+    def test_queries_do_not_rescan_unselected_text_children(self):
+        document = engine.Document()
+        document.feed('<article><div class="item">' + 'x</q>' * 1000 + '<span>Alpha</span></div></article>')
+        document.close()
+        scope = engine.query(document.root, '.item')[0]
+        self.assertEqual(engine.node_text(scope), 'x' * 1000 + 'Alpha')
+
+        class UnselectedText(list):
+            def __iter__(self):
+                raise AssertionError("A selector rescanned mixed text children")
+
+        scope.children = UnselectedText(scope.children)
+        self.assertEqual([node.tag for node in engine.query(scope, 'span')], ['span'])
+        self.assertEqual(engine.query(scope, 'b'), [])
+
     def test_noscript_fallback_is_not_a_field_or_visible_text(self):
         rules = {"item_selector": "article", "fields": [{"name": "price", "selector": ".price", "type": "number"}]}
         with self.assertRaises(engine.ContractError) as caught:
