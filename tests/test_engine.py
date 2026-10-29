@@ -13,6 +13,22 @@ RULES = json.loads((DATA / "rules.json").read_text())
 
 
 class EngineTests(unittest.TestCase):
+    def test_selector_combinators_use_css_whitespace_only(self):
+        html = '<article><div class="wrapper"><span class="price">24.50</span></div></article>'
+        rules = {"item_selector": "article", "fields": [{"name": "price", "selector": ".wrapper .price", "type": "number"}]}
+        for separator in ("\t", "\n", "\r", "\f", " "):
+            rules["fields"][0]["selector"] = ".wrapper" + separator + ".price"
+            self.assertEqual(engine.extract(html, rules)["items"], [{"price": 24.5}])
+        for separator in ("\u00a0", "\u0085", "\u2003", "\v"):
+            for selector in (".wrapper" + separator + ".price", separator + ".price", ".price" + separator):
+                with self.subTest(codepoint=ord(separator), position=selector.index(separator)):
+                    rules["fields"][0]["selector"] = selector
+                    with self.assertRaises(engine.ContractError) as caught:
+                        engine.extract(html, rules)
+                    self.assertEqual(caught.exception.code, "selector")
+        rules["fields"][0] = {"name": "price", "selector": '[data-note="a\u00a0b"]', "type": "number"}
+        self.assertEqual(engine.extract('<article><span data-note="a\u00a0b">24.50</span></article>', rules)["items"], [{"price": 24.5}])
+
     def test_fixture_produces_typed_data_and_provenance(self):
         result = engine.extract(HTML, RULES, retrieved_at="fixture-time")
         self.assertEqual(len(result["items"]), 3)

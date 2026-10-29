@@ -168,7 +168,7 @@ def compile_selector(selector: str) -> tuple[tuple[Simple, str], ...]:
     if selector == ":scope":
         return ()
     tokens, buffer, relation, quote, brackets = [], "", "descendant", None, 0
-    for char in selector.strip():
+    for char in selector.strip(" \t\n\r\f"):
         if quote:
             buffer += char
             if char == quote:
@@ -182,7 +182,7 @@ def compile_selector(selector: str) -> tuple[tuple[Simple, str], ...]:
         elif char == "]":
             brackets -= 1
             buffer += char
-        elif brackets == 0 and (char.isspace() or char == ">"):
+        elif brackets == 0 and (char in " \t\n\r\f" or char == ">"):
             if buffer:
                 tokens.append((simple_selector(buffer), relation))
                 buffer, relation = "", "descendant"
@@ -210,8 +210,11 @@ def work(budget, cost=1):
 
 
 def query(scope: Node, selector: str, budget=None) -> list[Node]:
+    return _query(scope, compile_selector(selector), budget)
+
+
+def _query(scope: Node, steps: tuple[tuple[Simple, str], ...], budget=None) -> list[Node]:
     budget = budget if budget is not None else [MAX_WORK]
-    steps = compile_selector(selector)
     if not steps:
         return [scope]
     output, pending, memo = [], list(reversed([c for c in scope.children if isinstance(c, Node)])), {}
@@ -369,14 +372,17 @@ def extract(html: str, rules: dict | str, *, source_kind="pasted", source_url: s
             raise
         raise ContractError("html", "HTML could not be parsed within the supported limits.") from exc
     budget = [MAX_WORK]
-    rows = query(parser.root, rules["item_selector"], budget)
+    # Compile within this extraction only; rule text is never retained in a global cache.
+    selectors = {selector: compile_selector(selector) for selector in
+                 (rules["item_selector"], *(spec["selector"] for spec in rules["fields"]))}
+    rows = _query(parser.root, selectors[rules["item_selector"]], budget)
     if not rules.get("min_items", 1) <= len(rows) <= rules.get("max_items", MAX_ITEMS) or ("expected_items" in rules and len(rows) != rules["expected_items"]):
         raise ContractError("schema_drift", "Item count no longer matches the contract.", [{"code": "item_count", "actual": len(rows)}])
     items, issues, output_size = [], [], 0
     for index, row in enumerate(rows):
         record = {}
         for spec in rules["fields"]:
-            matches = query(row, spec["selector"], budget)
+            matches = _query(row, selectors[spec["selector"]], budget)
             code = "ambiguous_field" if len(matches) > 1 else None
             if code:
                 record[spec["name"]] = None

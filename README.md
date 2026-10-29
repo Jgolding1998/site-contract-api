@@ -41,7 +41,7 @@ Types are `text`, `number`, `integer` and `url`. Fields are required by default;
 
 The exact count must fit `min_items` and `max_items`. Adjacent text and inline markup join without inserted spaces, including React comment boundaries; other elements and `<br>` separate words. Whitespace is normalized and CSS layout is not interpreted.
 
-Supported selectors: tags, `*`, `.class`, `#id`, `[attribute]`, `[attribute=value]`, descendant spaces and child `>`. A standalone `:scope` selects the item itself. Selector groups, pseudo-classes and JavaScript are unsupported. Write optional closing tags such as `</td>`, `</p>` and `</li>` explicitly; ambiguous omissions and nested links are rejected. The parser expects reasonably well-formed static HTML; it is not a browser DOM implementation.
+Supported selectors: tags, `*`, `.class`, `#id`, `[attribute]`, `[attribute=value]`, descendant ASCII whitespace and child `>`. Non-ASCII spacing characters and vertical tabs are rejected outside quoted attribute values. A standalone `:scope` selects the item itself. Selector groups, pseudo-classes and JavaScript are unsupported. Write optional closing tags such as `</td>`, `</p>` and `</li>` explicitly; ambiguous omissions and nested links are rejected. The parser expects reasonably well-formed static HTML; it is not a browser DOM implementation.
 
 Successful responses include typed items, a source hash, a rules hash, selectors and the capture time. Contract failures return named issues and no partial items. `/api/data` returns HTTP 409 for a failed contract.
 
