@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
-from site_contract_api.server import Server, Source
+from site_contract_api.server import Handler, Server, Source
 from .test_engine import HTML, RULES
 
 
@@ -262,13 +262,26 @@ class HTTPTests(unittest.TestCase):
 
     def test_slow_headers_release_all_connection_slots_at_the_deadline(self):
         connections, stop = [], threading.Event()
-        started = time.monotonic()
+        accepted, release = threading.Event(), threading.Event()
+        original_setup = Handler.setup
+
+        def admitted_setup(handler):
+            accepted.set()
+            if not release.wait(5):
+                raise TimeoutError("Test setup did not release admitted connections")
+            original_setup(handler)
+
         try:
-            with mock.patch("site_contract_api.server.HEADER_BUDGET", 0.2), mock.patch.object(self.server.source, "result") as source:
+            with mock.patch("site_contract_api.server.HEADER_BUDGET", 0.2), mock.patch.object(self.server.source, "result") as source, mock.patch.object(Handler, "setup", admitted_setup):
                 for _ in range(16):
+                    accepted.clear()
                     connection = socket.create_connection(("127.0.0.1", self.server.server_port), timeout=1)
                     connection.sendall(f"GET /api/data HTTP/1.1\r\nHost: {self.host}\r\nX-Drip: ".encode())
                     connections.append(connection)
+                    self.assertTrue(accepted.wait(1), "Server did not admit the test connection")
+
+                started = time.monotonic()
+                release.set()
 
                 def drip():
                     while not stop.wait(0.02):
@@ -288,6 +301,7 @@ class HTTPTests(unittest.TestCase):
                 source.assert_not_called()
                 self.assertLess(time.monotonic() - started, 1.5)
         finally:
+            release.set()
             stop.set()
             for connection in connections:
                 connection.close()
