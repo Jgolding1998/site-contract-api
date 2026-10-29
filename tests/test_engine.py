@@ -12,20 +12,44 @@ HTML = (DATA / "catalog.html").read_text()
 RULES = json.loads((DATA / "rules.json").read_text())
 
 
+def supports_scripting_parser():
+    try:
+        engine.HTMLParser(convert_charrefs=True, scripting=True)
+    except TypeError:
+        return False
+    return True
+
+
 class EngineTests(unittest.TestCase):
     def test_noscript_fallback_is_not_a_field_or_visible_text(self):
         rules = {"item_selector": "article", "fields": [{"name": "price", "selector": ".price", "type": "number"}]}
         with self.assertRaises(engine.ContractError) as caught:
             engine.extract('<article><noscript><span class="price">0</span></noscript></article>', rules)
-        self.assertEqual(caught.exception.code, "schema_drift")
-        self.assertEqual(caught.exception.issues[0]["code"], "missing_required")
+        if supports_scripting_parser():
+            self.assertEqual(caught.exception.code, "schema_drift")
+            self.assertEqual(caught.exception.issues[0]["code"], "missing_required")
+        else:
+            self.assertEqual(caught.exception.code, "html")
+            self.assertIn("text-only", caught.exception.message)
+        self.assertNotIn("items", caught.exception.as_dict())
         rules["fields"] = [{"name": "title", "selector": ":scope"}]
         self.assertEqual(engine.extract('<article>Ready<noscript>Enable scripts</noscript></article>', rules)["items"], [{"title": "Ready"}])
 
     def test_noscript_lazy_image_does_not_duplicate_real_image(self):
         html = '<article><img class="photo" data-src="/actual.png"><noscript><img class="photo" src="/fallback.png"></noscript></article>'
         rules = {"item_selector": "article", "fields": [{"name": "photo", "selector": ".photo", "attribute": "data-src", "type": "url"}]}
-        self.assertEqual(engine.extract(html, rules)["items"], [{"photo": "https://example.invalid/actual.png"}])
+        expected = [{"photo": "https://example.invalid/actual.png"}]
+        # The real image must work even when nested fallback markup is refused.
+        real_only = '<article><img class="photo" data-src="/actual.png"></article>'
+        self.assertEqual(engine.extract(real_only, rules)["items"], expected)
+        if supports_scripting_parser():
+            self.assertEqual(engine.extract(html, rules)["items"], expected)
+        else:
+            with self.assertRaises(engine.ContractError) as caught:
+                engine.extract(html, rules)
+            self.assertEqual(caught.exception.code, "html")
+            self.assertIn("text-only", caught.exception.message)
+            self.assertNotIn("items", caught.exception.as_dict())
 
     def test_legacy_raw_text_callbacks_fail_closed(self):
         # Simulate callback sequences on older supported HTMLParser patch levels.
