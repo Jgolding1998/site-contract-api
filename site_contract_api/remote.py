@@ -119,23 +119,38 @@ def bounded_get(host: str, address: str, path: str, limit: int) -> tuple[int, by
     connection = PinnedConnection(host, address, timeout=5)
     started = time.monotonic()
     expired = threading.Event()
+    finished = threading.Event()
+    lifecycle = threading.Lock()
+    transport = [None]
+    response = None
     connection.deadline = started + HTTPS_BUDGET
     connection.cancelled = expired
 
     def abort():
-        expired.set()
-        if connection.sock:
-            try:
-                connection.sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-        connection.close()
+        with lifecycle:
+            if finished.is_set():
+                return
+            expired.set()
+            active = transport[0] or connection.sock
+            if active:
+                try:
+                    active.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            connection.close()
+
+    def check_deadline():
+        if expired.is_set() or time.monotonic() >= started + HTTPS_BUDGET:
+            raise RemoteError("remote_timeout", "Remote read exceeded its time budget.")
 
     timer = threading.Timer(HTTPS_BUDGET, abort)
     timer.daemon = True
     timer.start()
     try:
         connection.request("GET", path, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity", "Accept": "text/html, text/plain;q=0.8", "Connection": "close"})
+        with lifecycle:
+            transport[0] = connection.sock
+        check_deadline()
         response = connection.getresponse()
         if 300 <= response.status < 400:
             raise RemoteError("remote_redirect", "Redirects are disabled; configure the final authorized URL.")
@@ -149,8 +164,10 @@ def bounded_get(host: str, address: str, path: str, limit: int) -> tuple[int, by
             remaining = HTTPS_BUDGET - (time.monotonic() - started)
             if expired.is_set() or remaining <= 0:
                 raise RemoteError("remote_timeout", "Remote read exceeded its time budget.")
-            if connection.sock:
-                connection.sock.settimeout(min(5, remaining))
+            if response.isclosed():
+                break
+            if transport[0]:
+                transport[0].settimeout(min(5, remaining))
             chunk = response.read1(min(16 * 1024, limit + 1 - received))
             if not chunk:
                 break
@@ -158,17 +175,22 @@ def bounded_get(host: str, address: str, path: str, limit: int) -> tuple[int, by
             received += len(chunk)
             if received > limit:
                 raise RemoteError("remote_limit", "Remote response exceeds the byte limit.")
+        check_deadline()
         if declared is not None and received != int(declared):
             raise RemoteError("remote_response", "Remote response was incomplete.")
         return response.status, b"".join(chunks), response.getheader("Content-Type", "")
     except (OSError, http.client.HTTPException, ValueError, AttributeError) as exc:
         if isinstance(exc, RemoteError):
             raise
-        if expired.is_set():
+        if isinstance(exc, TimeoutError) or expired.is_set() or time.monotonic() >= started + HTTPS_BUDGET:
             raise RemoteError("remote_timeout", "Remote read exceeded its time budget.") from exc
         raise RemoteError("remote_failure", "HTTPS read failed. No destination or response content was logged.") from exc
     finally:
+        with lifecycle:
+            finished.set()
         timer.cancel()
+        if response is not None:
+            response.close()
         connection.close()
 
 

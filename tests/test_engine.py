@@ -136,6 +136,32 @@ class EngineTests(unittest.TestCase):
         doc.feed('<template><article class="product" data-code="hidden"></article></template>')
         self.assertEqual(engine.query(doc.root, "article.product"), [])
 
+    def test_inline_markup_and_comments_do_not_split_text(self):
+        rules = lambda kind: {"item_selector": "article", "fields": [{"name": "v", "selector": ".v", "type": kind}]}
+        for html, kind, expected in (('<span class="v">$<!-- -->24.50</span>', "text", "$24.50"),
+                                     ('<span class="v">24<!-- -->.50</span>', "number", 24.5),
+                                     ('<span class="v">24<small>.50</small></span>', "number", 24.5),
+                                     ('<h2 class="v">Super<em>Drive</em> 3000</h2>', "text", "SuperDrive 3000"),
+                                     ('<span class="v">1<2</span>', "text", "1<2"),
+                                     ('<p class="v">One<br>Two</p>', "text", "One Two"),
+                                     ('<div class="v"><div>A</div><div>B</div></div>', "text", "A B")):
+            with self.subTest(html=html):
+                self.assertEqual(engine.extract(f"<article>{html}</article>", rules(kind))["items"], [{"v": expected}])
+
+    def test_class_tokens_split_on_ascii_whitespace_only(self):
+        rules = {"item_selector": "article", "fields": [{"name": "v", "selector": ".price", "required": False}]}
+        for separator in (" ", "\x1f", " "):
+            with self.subTest(separator=ascii(separator)):
+                self.assertEqual(engine.extract(f'<article><span class="price{separator}old">9</span></article>', rules)["items"], [{"v": None}])
+        self.assertEqual(engine.extract('<article><span class="old\t\nprice">9</span></article>', rules)["items"], [{"v": "9"}])
+
+    def test_expected_items_must_fit_the_item_range(self):
+        for patch in ({"expected_items": 5, "max_items": 2}, {"expected_items": 0}, {"expected_items": 1, "min_items": 2}):
+            with self.subTest(patch=patch), self.assertRaises(engine.ContractError) as caught:
+                engine.load_rules({**RULES, **patch})
+            self.assertEqual(caught.exception.code, "rules")
+        engine.load_rules({**RULES, "expected_items": 0, "min_items": 0})
+
     def test_value_limits_and_unsafe_urls(self):
         for value, kind in (("1e999", "number"), ("1.2", "integer"), ("1000000000001", "number"),
                             ("javascript:alert(1)", "url"), ("x" * 2049, "text")):

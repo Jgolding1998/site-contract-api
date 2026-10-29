@@ -14,6 +14,8 @@ python -m site_contract_api serve
 
 Open `http://127.0.0.1:8788`. The sample is a fictional product catalog. Edit the HTML or rules, run the contract, then try the broken-page button. Import controls accept your own authorized HTML capture and rules file. JSON downloads contain the displayed result, not the source HTML.
 
+Imports require UTF-8 text. Invalid bytes are rejected without replacing the current input.
+
 The fixed endpoint is `GET /api/data`. Editor previews do not change its source.
 
 ```sh
@@ -36,6 +38,8 @@ python -m site_contract_api serve --source page.html --rules rules.json
 ```
 
 Types are `text`, `number`, `integer` and `url`. Fields are required by default; an absent optional field becomes `null`. `expected_items` can enforce an exact count. `base_url` resolves relative links without fetching anything; without it, local previews use `https://example.invalid/`.
+
+The exact count must fit `min_items` and `max_items`. Adjacent text and inline markup join without inserted spaces, including React comment boundaries; other elements and `<br>` separate words. Whitespace is normalized and CSS layout is not interpreted.
 
 Supported selectors: tags, `*`, `.class`, `#id`, `[attribute]`, `[attribute=value]`, descendant spaces and child `>`. A standalone `:scope` selects the item itself. Selector groups, pseudo-classes and JavaScript are unsupported. Write optional closing tags such as `</td>`, `</p>` and `</li>` explicitly; ambiguous omissions and nested links are rejected. The parser expects reasonably well-formed static HTML; it is not a browser DOM implementation.
 

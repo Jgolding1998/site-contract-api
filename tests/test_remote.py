@@ -16,6 +16,7 @@ def addresses(*values):
 class FakeResponse:
     def __init__(self, status=200, body=b"ok", headers=None):
         self.status, self.body = status, body
+        self.closed = False
         self.headers = Message()
         for key, value in (headers or {}).items():
             self.headers[key] = value
@@ -26,6 +27,12 @@ class FakeResponse:
     def read1(self, amount):
         part, self.body = self.body[:amount], self.body[amount:]
         return part
+
+    def close(self):
+        self.closed = True
+
+    def isclosed(self):
+        return self.closed
 
 
 class RemoteTests(unittest.TestCase):
@@ -106,6 +113,113 @@ class RemoteTests(unittest.TestCase):
             with self.subTest(status=response.status), mock.patch.object(remote, "PinnedConnection", return_value=connection), self.assertRaises(remote.RemoteError):
                 remote.bounded_get("example.org", "1.1.1.1", "/", 16)
             connection.close.assert_called_once()
+            self.assertTrue(response.closed)
+
+    def test_eof_after_the_deadline_is_not_accepted_as_success(self):
+        now = [0.0]
+        response = FakeResponse(body=b"")
+        def late_eof(amount):
+            now[0] = remote.HTTPS_BUDGET + 1
+            return b""
+        response.read1 = late_eof
+        connection = mock.Mock(sock=None)
+        connection.getresponse.return_value = response
+        with mock.patch.object(remote,"PinnedConnection",return_value=connection), \
+                mock.patch.object(remote.time,"monotonic",side_effect=lambda:now[0]), self.assertRaises(remote.RemoteError) as caught:
+            remote.bounded_get("example.org","1.1.1.1","/",1024)
+        self.assertEqual(caught.exception.code,"remote_timeout")
+        self.assertTrue(response.closed)
+        connection.close.assert_called_once()
+
+    def test_cancelled_timer_cannot_close_a_finished_read(self):
+        callbacks = []
+        timer = mock.Mock()
+        def capture_timer(seconds,callback):
+            callbacks.append(callback)
+            return timer
+        response = FakeResponse()
+        connection = mock.Mock()
+        connection.getresponse.return_value = response
+        with mock.patch.object(remote,"PinnedConnection",return_value=connection), mock.patch.object(remote.threading,"Timer",side_effect=capture_timer):
+            self.assertEqual(remote.bounded_get("example.org","1.1.1.1","/",1024),(200,b"ok",""))
+            callbacks[0]()
+        self.assertTrue(response.closed)
+        connection.close.assert_called_once()
+        connection.sock.shutdown.assert_not_called()
+        timer.cancel.assert_called_once()
+
+    def test_complete_connection_close_responses_survive_transport_closure(self):
+        for body in (b"",b"ok",b"ok"*8193):
+            with self.subTest(body_bytes=len(body)):
+                listener = socket.socket()
+                listener.bind(("127.0.0.1",0))
+                listener.listen(1)
+                listener.settimeout(2)
+                port = listener.getsockname()[1]
+                stop = threading.Event()
+                def reply():
+                    try:
+                        channel,_ = listener.accept()
+                        with channel:
+                            channel.recv(4096)
+                            channel.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\nContent-Length: "+str(len(body)).encode()+b"\r\n\r\n"+body)
+                            stop.wait(0.3)
+                    except OSError:
+                        pass
+                thread = threading.Thread(target=reply,daemon=True)
+                thread.start()
+                original_connect = socket.create_connection
+                context = mock.Mock()
+                context.wrap_socket.side_effect = lambda raw,server_hostname:raw
+                try:
+                    with mock.patch.object(remote.ssl,"create_default_context",return_value=context), \
+                            mock.patch.object(remote.socket,"create_connection",side_effect=lambda address,timeout:original_connect(("127.0.0.1",port),timeout=timeout)):
+                        self.assertEqual(remote.bounded_get("example.org","1.1.1.1","/",len(body)+10),(200,body,"text/html"))
+                finally:
+                    stop.set()
+                    listener.close()
+                    thread.join(timeout=1)
+
+    def test_connection_close_body_deadline_keeps_the_response_socket_interruptible(self):
+        for declared in (False,True):
+            with self.subTest(declared=declared):
+                listener = socket.socket()
+                listener.bind(("127.0.0.1",0))
+                listener.listen(1)
+                listener.settimeout(2)
+                port = listener.getsockname()[1]
+                stop = threading.Event()
+                def drip():
+                    try:
+                        channel,_ = listener.accept()
+                        with channel:
+                            channel.recv(4096)
+                            headers = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n"
+                            if declared:
+                                headers += b"Content-Length: 2\r\n"
+                            channel.sendall(headers+b"\r\n")
+                            if not stop.wait(0.1):
+                                channel.sendall(b"x")
+                                stop.wait(0.1)
+                    except OSError:
+                        pass
+                thread = threading.Thread(target=drip,daemon=True)
+                thread.start()
+                original_connect = socket.create_connection
+                context = mock.Mock()
+                context.wrap_socket.side_effect = lambda raw,server_hostname:raw
+                start = time.monotonic()
+                try:
+                    with mock.patch.object(remote,"HTTPS_BUDGET",0.15), mock.patch.object(remote.ssl,"create_default_context",return_value=context), \
+                            mock.patch.object(remote.socket,"create_connection",side_effect=lambda address,timeout:original_connect(("127.0.0.1",port),timeout=timeout)), \
+                            self.assertRaises(remote.RemoteError) as caught:
+                        remote.bounded_get("example.org","1.1.1.1","/",1024)
+                    self.assertEqual(caught.exception.code,"remote_timeout")
+                    self.assertLess(time.monotonic()-start,1)
+                finally:
+                    stop.set()
+                    listener.close()
+                    thread.join(timeout=1)
 
     def test_body_stream_limit_and_time_budget(self):
         connection = mock.Mock(sock=None)

@@ -28,6 +28,8 @@ IMPLIED_BOUNDARIES = {"li": ({"li"}, {"ul", "ol"}), "dt": ({"dt", "dd"}, {"dl"})
                       "th": ({"td", "th"}, {"tr", "table"}), "tr": ({"tr"}, {"table", "tbody", "thead", "tfoot"}),
                       "option": ({"option"}, {"select", "datalist"}), "optgroup": ({"option", "optgroup"}, {"select"})}
 LINK_SCOPES = {"td", "th", "caption", "template", "object", "applet", "marquee"}
+INLINE = set("a abbr acronym b bdi bdo big cite code data del dfn em font i img ins kbd label mark nobr q rb rp rt ruby s samp small span strike strong sub sup time tt u var wbr".split())
+ASCII_SPACE = r"[\t\n\f\r ]+"
 IDENT = r"[A-Za-z_][A-Za-z0-9_-]*"
 
 
@@ -58,7 +60,7 @@ class Node:
     classes: frozenset[str] = field(init=False)
 
     def __post_init__(self):
-        self.classes = frozenset(self.attrs.get("class", "").split())
+        self.classes = frozenset(filter(None, re.split(ASCII_SPACE, self.attrs.get("class", ""))))
 
 
 class Document(HTMLParser):
@@ -255,12 +257,17 @@ def node_text(node: Node, budget=None) -> str:
     while pending:
         work(budget)
         current = pending.pop()
-        if isinstance(current, str):
+        if current is None:
+            pieces.append(" ")
+        elif isinstance(current, str):
             work(budget, len(current) // 16)
             pieces.append(current)
         elif current.tag not in HIDDEN:
+            if current.tag not in INLINE:
+                pieces.append(" ")
+                pending.append(None)
             pending.extend(reversed(current.children))
-    return " ".join(" ".join(pieces).split())
+    return " ".join("".join(pieces).split())
 
 
 def load_rules(value: dict | str) -> dict:
@@ -291,6 +298,8 @@ def load_rules(value: dict | str) -> dict:
             raise ContractError("rules", "Minimum item count exceeds the maximum.")
         if "expected_items" in value and (type(value["expected_items"]) is not int or not 0 <= value["expected_items"] <= MAX_ITEMS):
             raise ContractError("rules", "Expected item count must be an integer from 0 to 200.")
+        if "expected_items" in value and not value.get("min_items", 1) <= value["expected_items"] <= value.get("max_items", MAX_ITEMS):
+            raise ContractError("rules", "Expected item count must be within min_items and max_items.")
         fields = value.get("fields")
         if not isinstance(fields, list) or not 1 <= len(fields) <= MAX_FIELDS:
             raise ContractError("rules", "Define 1 to 16 fields.")

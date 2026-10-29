@@ -73,8 +73,8 @@
       const file = $(id).files[0];
       if (file.size > limit) { status("File too large.", "Use a smaller input file.", "error"); $(id).value = ""; return; }
       busy = true; controls();
-      try { target.value = await file.text(); changed(); status("File imported.", "Review the input, then run the contract."); }
-      catch (_) { status("Import failed.", "The file could not be read.", "error"); }
+      try { target.value = new TextDecoder("utf-8", {fatal: true}).decode(await file.arrayBuffer()); changed(); status("File imported.", "Review the input, then run the contract."); }
+      catch (_) { status("Import failed.", "The file must be readable UTF-8 text.", "error"); }
       finally { busy = false; $(id).value = ""; controls(); }
     });
   }
