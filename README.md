@@ -18,6 +18,8 @@ Imports require UTF-8 text. Invalid bytes are rejected without replacing the cur
 
 The fixed endpoint is `GET /api/data`. Editor previews do not change its source.
 
+Repeated fixed-endpoint reads reuse one validated result when the source content, loaded rules and resolution URL match. Each request still reopens and reads a local file, or calls the configured HTTPS reader so its refresh and robots policy remain in force. Read or validation failures discard the entry on that request. Editing or deleting a source does not clear retained values until the next read. The cache holds at most one 3 MiB result, including selected values and provenance, in process memory; it does not retain a separate copy of the input capture. Local capture times remain fresh and HTTPS capture times follow the remote reader. Editor previews are not cached.
+
 ```sh
 python -m site_contract_api preview --source page.html --rules rules.json
 python -m site_contract_api serve --source page.html --rules rules.json

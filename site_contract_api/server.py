@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -50,20 +52,50 @@ class Source:
         self.rules = load_rules(rules)
         self.path, self.remote = path, remote
         self.lock = threading.Lock()
+        self._cached = None
 
     def result(self):
         with self.lock:
-            if self.remote:
-                html = self.remote.read()
-                return extract(html, self.rules, source_kind="https", source_url=self.remote.url, retrieved_at=self.remote.retrieved_at)
-            try:
-                with Path(self.path).open("rb") as stream:
-                    body = stream.read(MAX_HTML + 1)
-                if len(body) > MAX_HTML:
-                    raise ContractError("html_limit", "Configured source exceeds 1 MB.")
-                return extract(body.decode("utf-8-sig"), self.rules, source_kind="local")
-            except (OSError, UnicodeError) as exc:
-                raise ContractError("source", "Configured source is unavailable or is not UTF-8 text.") from exc
+            previous, self._cached = self._cached, None
+            remote = self.remote
+            kind, url, captured = "local", None, None
+            if remote:
+                html = remote.read()
+                kind, url, captured = "https", remote.url, remote.retrieved_at
+                if not isinstance(html, str):
+                    return extract(html, self.rules, source_kind=kind, source_url=url, retrieved_at=captured)
+                try:
+                    identity = html.encode("utf-8")
+                except UnicodeError:
+                    return extract(html, self.rules, source_kind=kind, source_url=url, retrieved_at=captured)
+                if len(identity) > MAX_HTML:
+                    return extract(html, self.rules, source_kind=kind, source_url=url, retrieved_at=captured)
+            else:
+                try:
+                    with Path(self.path).open("rb") as stream:
+                        identity = stream.read(MAX_HTML + 1)
+                    if len(identity) > MAX_HTML:
+                        raise ContractError("html_limit", "Configured source exceeds 1 MB.")
+                    html = identity.decode("utf-8-sig")
+                except (OSError, UnicodeError) as exc:
+                    raise ContractError("source", "Configured source is unavailable or is not UTF-8 text.") from exc
+            rules = load_rules(self.rules)
+            canonical = json.dumps(rules, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            key = (kind, url, hashlib.sha256(identity).digest(), hashlib.sha256(canonical.encode("utf-8")).digest())
+            if previous is not None and previous[0] == key:
+                # Every read/policy check still runs. The JSON round trip gives
+                # each caller its own result; only the capture time is per-read.
+                result = json.loads(previous[1])
+                result["provenance"]["retrieved_at"] = captured or datetime.now(timezone.utc).isoformat()
+                self._cached = previous
+                return result
+            previous = None
+            # Snapshot mutable rules so the key and extraction use the same data.
+            result = extract(html, json.loads(canonical), source_kind=kind, source_url=url, retrieved_at=captured)
+            # One process-local entry, bounded by the existing response cap. No
+            # separate input capture is retained; failures leave no entry.
+            self._cached = (key, encoded_response(result, MAX_OUTPUT))
+            return result
 
 
 class Server(ThreadingHTTPServer):

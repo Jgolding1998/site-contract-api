@@ -78,6 +78,21 @@ class HTTPTests(unittest.TestCase):
         self.assertTrue(headers["Set-Cookie"].startswith(f"sca_csrf_{self.server.server_port}="))
         self.assertNotIn(b"{{CSRF}}", body)
 
+    def test_cached_endpoint_keeps_origin_and_processing_admission_checks(self):
+        self.assertEqual(self.request()[0], 200)
+        with mock.patch.object(self.server.source, "result", side_effect=AssertionError("A rejected request must not read cached data")):
+            self.assertEqual(self.request(headers={"Origin": "https://elsewhere.invalid"})[0], 403)
+            self.assertEqual(self.request(headers={"Sec-Fetch-Site": "cross-site"})[0], 403)
+            self.server.jobs.acquire()
+            self.server.jobs.acquire()
+            try:
+                status, _, body = self.request()
+                self.assertEqual(status, 503)
+                self.assertEqual(json.loads(body)["error"], "busy")
+            finally:
+                self.server.jobs.release()
+                self.server.jobs.release()
+
     def test_two_instances_share_a_browser_cookie_jar_without_overwriting_tokens(self):
         second = Server(("127.0.0.1", 0), Source(RULES, self.source_path), HTML, RULES)
         thread = threading.Thread(target=second.serve_forever, daemon=True)
