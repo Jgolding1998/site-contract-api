@@ -15,3 +15,9 @@ Extraction accounts for escaped output values, and HTTP JSON serialization stops
 An HTML capture is not proof that the data is true. A passing contract checks selected fields, counts and types, not every change to a page. Hashes identify inputs; they are not signatures. The HTML parser supports a documented subset of selectors and cannot reproduce every browser repair of malformed markup.
 
 Report bugs with synthetic HTML and rules. Do not attach credentials, private page captures or business data to an issue.
+
+## Reporting a vulnerability
+
+Use [Security > Report a vulnerability](https://github.com/Jgolding1998/site-contract-api/security/advisories/new) to send a private report. Do not submit vulnerability details through the public feedback form.
+
+Include the affected version, platform, expected behavior and a synthetic reproduction. Leave out credentials, personal information and private files.
