@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -11,18 +10,39 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from .engine import ContractError, MAX_HTML, extract, json_object, load_rules
+from .engine import ContractError, MAX_HTML, MAX_OUTPUT, extract, json_object, load_rules
 
 ROOT = Path(__file__).resolve().parent
 MAX_BODY = 3 * 1024 * 1024
 HEADER_BUDGET = 10
 BODY_BUDGET = 10
+MAX_RESPONSE = MAX_OUTPUT
 HEADERS = {
     "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
     "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer", "Cross-Origin-Resource-Policy": "same-origin",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
 }
+
+
+def encoded_response(value, limit):
+    chunks, size = [], 0
+    for chunk in json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":")).iterencode(value):
+        part = chunk.encode("utf-8")
+        size += len(part)
+        if size > limit:
+            raise ContractError("output_limit", "Response output exceeds the 3 MiB limit. Use fewer items or fields.")
+        chunks.append(part)
+    return b"".join(chunks)
+
+
+def csrf_cookie(header, cookie_name):
+    values = []
+    for part in header.split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and name == cookie_name:
+            values.append(value)
+    return values[0] if len(values) == 1 and re.fullmatch(r"[A-Za-z0-9_-]{43}", values[0]) else None
 
 
 class Source:
@@ -55,6 +75,7 @@ class Server(ThreadingHTTPServer):
         super().__init__(address, Handler)
         self.source, self.demo_html, self.demo_rules = source, demo_html, demo_rules
         self.token = secrets.token_urlsafe(32)
+        self.cookie_name = f"sca_csrf_{self.server_port}"
         self.jobs = threading.BoundedSemaphore(2)
 
     def process_request(self, request, client_address):
@@ -155,19 +176,23 @@ class Handler(BaseHTTPRequestHandler):
         for key, value in HEADERS.items():
             self.send_header(key, value)
         if cookie:
-            self.send_header("Set-Cookie", f"sca_csrf={self.server.token}; HttpOnly; SameSite=Strict; Path=/")
+            self.send_header("Set-Cookie", f"{self.server.cookie_name}={self.server.token}; HttpOnly; SameSite=Strict; Path=/")
         self.end_headers()
         if getattr(self, "command", None) != "HEAD":
             self.wfile.write(body)
 
     def send_json(self, status, value):
-        self.send_body(status, json.dumps(value, ensure_ascii=False, allow_nan=False).encode())
+        try:
+            body = encoded_response(value, MAX_RESPONSE)
+        except ContractError as exc:
+            status, body = 413, json.dumps(exc.as_dict()).encode("ascii")
+        self.send_body(status, body)
 
     def guard(self, mutation=False):
         if len(self.headers) > 32 or sum(len(k) + len(v) for k, v in self.headers.items()) > 8192:
             self.send_json(431, {"ok": False, "error": "headers", "message": "Request headers exceed the limit."})
             return False
-        if self.headers.get("Transfer-Encoding") is not None or any(len(self.headers.get_all(name, [])) > 1 for name in ("Host", "Origin", "Content-Length", "Content-Type")):
+        if self.headers.get("Transfer-Encoding") is not None or any(len(self.headers.get_all(name, [])) > 1 for name in ("Host", "Origin", "Content-Length", "Content-Type", "Cookie", "X-CSRF-Token")):
             self.send_json(400, {"ok": False, "error": "headers", "message": "Ambiguous request headers."})
             return False
         expected = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
@@ -182,16 +207,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 origin = self.headers.get("Origin", "")
                 parsed = urlsplit(origin)
-                cookie = SimpleCookie()
-                cookie.load(self.headers.get("Cookie", ""))
+                cookie = csrf_cookie(self.headers.get("Cookie", ""), self.server.cookie_name)
                 supplied = self.headers.get("X-CSRF-Token", "")
                 valid = (origin.lower() == "http://" + host and parsed.path == "" and parsed.query == "" and parsed.fragment == ""
                          and self.headers.get("Sec-Fetch-Site", "same-origin") == "same-origin"
                          and bool(re.fullmatch(r"[A-Za-z0-9_-]{43}", supplied))
                          and secrets.compare_digest(supplied, self.server.token)
-                         and cookie.get("sca_csrf") is not None
-                         and secrets.compare_digest(cookie["sca_csrf"].value, self.server.token))
-            except (CookieError, ValueError, TypeError):
+                         and cookie is not None
+                         and secrets.compare_digest(cookie, self.server.token))
+            except (ValueError, TypeError):
                 valid = False
             if not valid:
                 self.send_json(403, {"ok": False, "error": "origin", "message": "Same-origin request and CSRF token required."})
@@ -220,7 +244,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.send_json(200, self.server.source.result())
             except ContractError as exc:
-                self.send_json(409 if exc.code == "schema_drift" else 502, exc.as_dict())
+                self.send_json(409 if exc.code == "schema_drift" else 413 if exc.code == "output_limit" else 502, exc.as_dict())
             finally:
                 self.server.jobs.release()
         else:
@@ -259,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError()
             self.send_json(200, extract(value["html"], value["rules"]))
         except ContractError as exc:
-            self.send_json(422, exc.as_dict())
+            self.send_json(413 if exc.code == "output_limit" else 422, exc.as_dict())
         except TimeoutError:
             self.send_json(408, {"ok": False, "error": "timeout", "message": "Upload timed out."})
         except (ValueError, UnicodeError, RecursionError):

@@ -34,6 +34,19 @@ class CLITests(unittest.TestCase):
                 read_text(path.parent / "absent.txt", 100)
             self.assertNotIn(str(path.parent), caught.exception.message)
 
+    def test_malformed_numeric_and_unicode_rules_fail_without_tracebacks(self):
+        fixtures = ['{"item_selector":"article","min_items":' + "1" * 5000 + ',"fields":[{"name":"title","selector":":scope"}]}',
+                    '{"item_selector":"article","base_url":"https://example.invalid/\\ud800","fields":[{"name":"title","selector":":scope"}]}']
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            for fixture in fixtures:
+                path.write_text(fixture, encoding="utf-8")
+                with self.subTest(length=len(fixture)), contextlib.redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(main(["preview", "--rules", str(path)]), 1)
+                self.assertEqual(json.loads(error.getvalue())["error"], "rules")
+                self.assertNotIn("Traceback", error.getvalue())
+                self.assertNotIn(directory, error.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

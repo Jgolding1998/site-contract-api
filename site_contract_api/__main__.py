@@ -40,7 +40,7 @@ def main(argv=None):
         demo_rules = load_rules(read_text(ROOT / "data" / "rules.json", MAX_RULES))
         if args.command == "preview":
             html = read_text(args.source or ROOT / "data" / "catalog.html", MAX_HTML)
-            print(json.dumps(extract(html, rules, source_kind="local"), ensure_ascii=False, indent=2))
+            print(json.dumps(extract(html, rules, source_kind="local"), ensure_ascii=True, indent=2))
             return 0
         if not 1 <= args.port <= 65535:
             raise ContractError("port", "Port must be from 1 to 65535.")

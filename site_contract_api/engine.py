@@ -18,8 +18,15 @@ MAX_ITEMS = 200
 MAX_FIELDS = 16
 MAX_VALUE = 2048
 MAX_WORK = 500_000
+MAX_OUTPUT = 3 * 1024 * 1024
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 HIDDEN = {"script", "style", "template"}
+OPTIONAL_END = {"p", "li", "dt", "dd", "td", "th", "tr", "thead", "tbody", "tfoot", "option", "optgroup", "colgroup"}
+P_BLOCKS = set("address article aside blockquote details dialog div dl fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre search section table ul li dt dd tr td th".split())
+IMPLIED_BOUNDARIES = {"li": ({"li"}, {"ul", "ol"}), "dt": ({"dt", "dd"}, {"dl"}),
+                      "dd": ({"dt", "dd"}, {"dl"}), "td": ({"td", "th"}, {"tr", "table"}),
+                      "th": ({"td", "th"}, {"tr", "table"}), "tr": ({"tr"}, {"table", "tbody", "thead", "tfoot"}),
+                      "option": ({"option"}, {"select", "datalist"}), "optgroup": ({"option", "optgroup"}, {"select"})}
 IDENT = r"[A-Za-z_][A-Za-z0-9_-]*"
 
 
@@ -61,6 +68,15 @@ class Document(HTMLParser):
         self.nodes = 0
 
     def handle_starttag(self, tag, attrs):
+        if tag in P_BLOCKS and any(node.tag == "p" for node in self.stack):
+            raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
+        if tag in IMPLIED_BOUNDARIES:
+            previous, containers = IMPLIED_BOUNDARIES[tag]
+            for node in reversed(self.stack):
+                if node.tag in containers:
+                    break
+                if node.tag in previous:
+                    raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
         self.nodes += 1
         if self.nodes > MAX_NODES or len(self.stack) > MAX_DEPTH or len(attrs) > 32:
             raise ContractError("html_limit", "HTML structure exceeds the node, depth or attribute limit.")
@@ -81,8 +97,15 @@ class Document(HTMLParser):
     def handle_endtag(self, tag):
         for index in range(len(self.stack) - 1, 0, -1):
             if self.stack[index].tag == tag:
+                if any(node.tag in OPTIONAL_END for node in self.stack[index + 1:]):
+                    raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
                 del self.stack[index:]
                 break
+
+    def close(self):
+        super().close()
+        if any(node.tag in OPTIONAL_END for node in self.stack):
+            raise ContractError("html", "Write optional HTML closing tags explicitly before extracting fields.")
 
     def handle_data(self, data):
         if data and not any(node.tag in HIDDEN for node in self.stack):
@@ -278,9 +301,13 @@ def load_rules(value: dict | str) -> dict:
             attribute = item.get("attribute")
             if attribute is not None and (not isinstance(attribute, str) or not re.fullmatch(r"(?:href|src|title|alt|value|data-[a-z0-9_-]{1,40})", attribute)):
                 raise ContractError("rules", "Unsupported extraction attribute.")
+        if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > MAX_RULES:
+            raise ContractError("rules_limit", "Rules exceed 32 KB.")
         return value
-    except (json.JSONDecodeError, TypeError, RecursionError) as exc:
-        raise ContractError("rules", "Rules must be valid, bounded JSON.") from exc
+    except ContractError:
+        raise
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise ContractError("rules", "Rules must be valid, bounded UTF-8 JSON.") from exc
 
 
 def convert(raw: str, kind: str, base_url: str | None):
@@ -310,7 +337,11 @@ def convert(raw: str, kind: str, base_url: str | None):
 
 
 def extract(html: str, rules: dict | str, *, source_kind="pasted", source_url: str | None = None, retrieved_at: str | None = None) -> dict:
-    if not isinstance(html, str) or len(html.encode("utf-8")) > MAX_HTML:
+    try:
+        valid_html = isinstance(html, str) and len(html.encode("utf-8")) <= MAX_HTML
+    except UnicodeError:
+        valid_html = False
+    if not valid_html:
         raise ContractError("html_limit", "HTML must be UTF-8 text no larger than 1 MB.")
     rules = load_rules(rules)
     parser = Document()
@@ -325,7 +356,7 @@ def extract(html: str, rules: dict | str, *, source_kind="pasted", source_url: s
     rows = query(parser.root, rules["item_selector"], budget)
     if not rules.get("min_items", 1) <= len(rows) <= rules.get("max_items", MAX_ITEMS) or ("expected_items" in rules and len(rows) != rules["expected_items"]):
         raise ContractError("schema_drift", "Item count no longer matches the contract.", [{"code": "item_count", "actual": len(rows)}])
-    items, issues = [], []
+    items, issues, output_size = [], [], 0
     for index, row in enumerate(rows):
         record = {}
         for spec in rules["fields"]:
@@ -350,6 +381,9 @@ def extract(html: str, rules: dict | str, *, source_kind="pasted", source_url: s
                     code = str(exc) if str(exc) in {"type_changed", "unsafe_url", "field_too_long"} else "invalid_field"
             if code:
                 issues.append({"item": index, "field": spec["name"], "code": code})
+            output_size += len(json.dumps({spec["name"]: record.get(spec["name"])}, ensure_ascii=False).encode("utf-8"))
+            if output_size > MAX_OUTPUT - 64 * 1024:
+                raise ContractError("output_limit", "Extraction output exceeds the 3 MiB limit. Use fewer items or fields.")
         items.append(record)
     if issues:
         raise ContractError("schema_drift", "Required fields, cardinality or types no longer match the contract.", issues)

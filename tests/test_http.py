@@ -1,5 +1,6 @@
 import copy
 import http.client
+import http.cookiejar
 import json
 from pathlib import Path
 import socket
@@ -8,6 +9,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
 from site_contract_api.server import Server, Source
 from .test_engine import HTML, RULES
@@ -36,7 +38,7 @@ class HTTPTests(unittest.TestCase):
         defaults = {"Host": self.host}
         if method == "POST":
             defaults.update({"Origin": "http://" + self.host, "Content-Type": "application/json",
-                             "X-CSRF-Token": self.server.token, "Cookie": "sca_csrf=" + self.server.token})
+                             "X-CSRF-Token": self.server.token, "Cookie": self.server.cookie_name + "=" + self.server.token})
         connection.request(method, path, body, headers={**defaults, **(headers or {})})
         response = connection.getresponse()
         status, result_headers, data = response.status, dict(response.getheaders()), response.read()
@@ -53,7 +55,35 @@ class HTTPTests(unittest.TestCase):
         status, headers, body = self.request(path="/")
         self.assertEqual(status, 200)
         self.assertIn("HttpOnly", headers["Set-Cookie"])
+        self.assertTrue(headers["Set-Cookie"].startswith(f"sca_csrf_{self.server.server_port}="))
         self.assertNotIn(b"{{CSRF}}", body)
+
+    def test_two_instances_share_a_browser_cookie_jar_without_overwriting_tokens(self):
+        second = Server(("127.0.0.1", 0), Source(RULES, self.source_path), HTML, RULES)
+        thread = threading.Thread(target=second.serve_forever, daemon=True)
+        thread.start()
+        jar = http.cookiejar.CookieJar()
+        browser = build_opener(ProxyHandler({}), HTTPCookieProcessor(jar))
+        try:
+            for instance in (self.server, second):
+                with browser.open(f"http://127.0.0.1:{instance.server_port}/", timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    response.read()
+            self.assertEqual({cookie.name for cookie in jar}, {self.server.cookie_name, second.cookie_name})
+            body = json.dumps({"html": HTML, "rules": RULES}).encode()
+            for instance in (self.server, second, self.server):
+                origin = f"http://127.0.0.1:{instance.server_port}"
+                request = Request(origin + "/api/preview", data=body,
+                                  headers={"Origin": origin, "Content-Type": "application/json", "X-CSRF-Token": instance.token})
+                with browser.open(request, timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertTrue(json.loads(response.read())["ok"])
+            self.assertEqual(self.request("POST", "/api/preview", {"html": HTML, "rules": RULES},
+                                          {"Cookie": f"{self.server.cookie_name}={second.token}"})[0], 403)
+        finally:
+            second.shutdown()
+            second.server_close()
+            thread.join(timeout=2)
 
     def test_preview_is_real_and_does_not_reconfigure_endpoint(self):
         changed = HTML.replace("Precision driver kit", "Different preview title")
@@ -68,6 +98,27 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(json.loads(body)["error"], "schema_drift")
         self.assertNotIn("items", json.loads(body))
+
+    def test_invalid_unicode_config_returns_fixed_json_and_can_recover(self):
+        self.server.source.rules = {**RULES, "base_url": "https://example.invalid/\ud800"}
+        status, headers, body = self.request()
+        self.assertEqual(status, 502)
+        self.assertEqual(json.loads(body)["error"], "rules")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertNotIn(b"Traceback", body)
+        self.assertNotIn(str(self.source_path).encode(), body)
+        self.server.source.rules = RULES
+        self.assertEqual(self.request()[0], 200)
+
+    def test_large_integer_and_surrogate_preview_rules_are_controlled(self):
+        fixtures = ['{"item_selector":"article","min_items":' + "1" * 5000 + ',"fields":[{"name":"title","selector":":scope"}]}',
+                    '{"item_selector":"article","base_url":"https://example.invalid/\\ud800","fields":[{"name":"title","selector":":scope"}]}']
+        for rules in fixtures:
+            with self.subTest(length=len(rules)):
+                status, _, body = self.request("POST", "/api/preview", {"html": HTML, "rules": rules})
+                self.assertEqual(status, 422)
+                self.assertEqual(json.loads(body)["error"], "rules")
+                self.assertNotIn("items", json.loads(body))
 
     def test_missing_or_invalid_origin_cookie_and_token_fail(self):
         body = {"html": HTML, "rules": RULES}
@@ -116,7 +167,7 @@ class HTTPTests(unittest.TestCase):
             connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=1)
             connection.putrequest("POST", "/api/preview")
             for key, value in {"Origin": "http://" + self.host, "X-CSRF-Token": self.server.token,
-                               "Cookie": "sca_csrf=" + self.server.token, "Content-Type": "application/json",
+                               "Cookie": self.server.cookie_name + "=" + self.server.token, "Content-Type": "application/json",
                                "Content-Length": "1000"}.items():
                 connection.putheader(key, value)
             connection.endheaders()
@@ -192,7 +243,7 @@ class HTTPTests(unittest.TestCase):
         try:
             with mock.patch("site_contract_api.server.BODY_BUDGET", 0.15):
                 headers = (f"POST /api/preview HTTP/1.1\r\nHost: {self.host}\r\nOrigin: http://{self.host}\r\n"
-                           f"Cookie: sca_csrf={self.server.token}\r\nX-CSRF-Token: {self.server.token}\r\n"
+                           f"Cookie: {self.server.cookie_name}={self.server.token}\r\nX-CSRF-Token: {self.server.token}\r\n"
                            "Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n")
                 connection.sendall(headers.encode())
 

@@ -189,7 +189,7 @@ class RemoteSource:
         now = time.monotonic()
         if self.last_attempt is not None and now - self.last_attempt < self.interval:
             if self.last_error:
-                raise self.last_error
+                raise RemoteError(*self.last_error)
             return self.cached
         self.last_attempt = now
         try:
@@ -198,13 +198,18 @@ class RemoteSource:
             delay = 1
             if status == 200:
                 policy = RobotFileParser()
-                policy.parse(body.decode("utf-8", "replace").splitlines())
+                try:
+                    policy.parse(body.decode("utf-8", "replace").splitlines())
+                    delay = max(delay, policy.crawl_delay(USER_AGENT) or 0)
+                    rate = policy.request_rate(USER_AGENT)
+                    if rate:
+                        if rate.requests <= 0 or rate.seconds <= 0:
+                            raise ValueError()
+                        delay = max(delay, rate.seconds / rate.requests)
+                except (ValueError, ZeroDivisionError, OverflowError):
+                    raise RemoteError("robots_invalid", "robots.txt contains an unsupported rate or delay.") from None
                 if not policy.can_fetch(USER_AGENT, self.url):
                     raise RemoteError("robots_denied", "robots.txt does not permit this source.")
-                delay = max(delay, policy.crawl_delay(USER_AGENT) or 0)
-                rate = policy.request_rate(USER_AGENT)
-                if rate:
-                    delay = max(delay, rate.seconds / rate.requests)
                 if delay > 10:
                     raise RemoteError("robots_delay", "The advertised crawl delay exceeds this tool's interactive budget. Use an authorized local capture.")
             elif status != 404:
@@ -219,5 +224,6 @@ class RemoteSource:
             self.last_error = None
             return self.cached
         except (ContractError, UnicodeError) as exc:
-            self.last_error = exc if isinstance(exc, ContractError) else RemoteError("remote_encoding", "Remote HTML must use UTF-8.")
-            raise self.last_error
+            self.last_error = ((exc.code, exc.message) if isinstance(exc, ContractError)
+                               else ("remote_encoding", "Remote HTML must use UTF-8."))
+        raise RemoteError(*self.last_error) from None

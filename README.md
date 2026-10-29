@@ -37,9 +37,11 @@ python -m site_contract_api serve --source page.html --rules rules.json
 
 Types are `text`, `number`, `integer` and `url`. Fields are required by default; an absent optional field becomes `null`. `expected_items` can enforce an exact count. `base_url` resolves relative links without fetching anything; without it, local previews use `https://example.invalid/`.
 
-Supported selectors: tags, `*`, `.class`, `#id`, `[attribute]`, `[attribute=value]`, descendant spaces and child `>`. A standalone `:scope` selects the item itself. Selector groups, pseudo-classes and JavaScript are unsupported. The parser expects reasonably well-formed static HTML; it is not a browser DOM implementation.
+Supported selectors: tags, `*`, `.class`, `#id`, `[attribute]`, `[attribute=value]`, descendant spaces and child `>`. A standalone `:scope` selects the item itself. Selector groups, pseudo-classes and JavaScript are unsupported. Write optional closing tags such as `</td>`, `</p>` and `</li>` explicitly; ambiguous omissions are rejected. The parser expects reasonably well-formed static HTML; it is not a browser DOM implementation.
 
 Successful responses include typed items, a source hash, a rules hash, selectors and the capture time. Contract failures return named issues and no partial items. `/api/data` returns HTTP 409 for a failed contract.
+
+CLI output uses JSON Unicode escapes so redirected results also work with Windows terminal encodings.
 
 ## Optional HTTPS source
 
@@ -59,4 +61,4 @@ python -m unittest discover -s tests -t . -v
 
 Tests use fictional HTML, temporary local HTTP servers and mocked remote transports. A local socket test verifies that slowly delivered response headers are interrupted. No third-party site is contacted by the test suite.
 
-Limits include 1 MB HTML, 32 KB rules, 200 items, 16 fields, eight selector steps, bounded tree/work counts, two processing slots and 16 connections. Remote DNS has a three-second budget and HTTPS reads have a ten-second watchdog; robots checks and crawl delays add separate bounded work. This is a loopback tool, not a production hosting platform. JavaScript sites need an authorized static capture. There is no authentication bypass, CAPTCHA solving or automatic selector repair.
+Limits include 1 MB HTML, 32 KB rules, 200 items, 16 fields, eight selector steps, bounded tree/work counts, two processing slots and 16 connections. Repeated fields and nested items can exceed the output budget even with small inputs. Extraction stops early and HTTP JSON serialization is capped at 3 MiB, returning a small error instead of partial data. Remote DNS has a three-second budget and HTTPS reads have a ten-second watchdog; robots checks and crawl delays add separate bounded work. This is a loopback tool, not a production hosting platform. JavaScript sites need an authorized static capture. There is no authentication bypass, CAPTCHA solving or automatic selector repair.

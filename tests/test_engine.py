@@ -100,6 +100,22 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(engine.ContractError):
             engine.load_rules('{"item_selector":"a","item_selector":"b","fields":[]}')
 
+    def test_large_json_integer_has_a_controlled_rules_error(self):
+        text = '{"item_selector":"article","min_items":' + "1" * 5000 + ',"fields":[{"name":"title","selector":":scope"}]}'
+        self.assertLess(len(text.encode()), engine.MAX_RULES)
+        with self.assertRaises(engine.ContractError) as caught:
+            engine.load_rules(text)
+        self.assertEqual(caught.exception.code, "rules")
+        self.assertNotIn("5000", caught.exception.message)
+
+    def test_surrogate_rules_are_rejected_before_extraction(self):
+        for patch in ({"base_url": "https://example.invalid/\ud800"}, {"fields": [{"name": "title", "selector": '[data-label="\ud800"]', "required": False}]}):
+            rules = {**RULES, **patch}
+            for value in (rules, json.dumps(rules)):
+                with self.subTest(patch=list(patch), encoded=isinstance(value, str)), self.assertRaises(engine.ContractError) as caught:
+                    engine.load_rules(value)
+                self.assertEqual(caught.exception.code, "rules")
+
     def test_input_and_structure_limits(self):
         for html in ("x" * (engine.MAX_HTML + 1), "<div>" * 66, "<br>" * (engine.MAX_NODES + 1),
                      '<p ' + " ".join(f'data-{i}="x"' for i in range(33)) + ">", '<p id="a" id="b">'):
