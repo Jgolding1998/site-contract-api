@@ -5,20 +5,36 @@ import json
 from pathlib import Path
 import sys
 
-from .engine import ContractError, MAX_HTML, MAX_RULES, extract, load_rules
+from .engine import ContractError, MAX_HTML, MAX_RULES, UTF8_BOM, decode_html, extract, html_bytes_error, load_rules
 from .remote import RemoteSource
 from .server import ROOT, Server, Source
 
 
-def read_text(path: Path, limit: int) -> str:
+def read_text(path: Path, limit: int, label: str = "input") -> str:
     try:
         with path.open("rb") as stream:
-            data = stream.read(limit + 1)
-        if len(data) > limit:
-            raise ContractError("file_limit", "An input file exceeds its documented size limit.")
-        return data.decode("utf-8-sig")
-    except (OSError, UnicodeError) as exc:
-        raise ContractError("file", "An input file is unavailable or is not UTF-8 text.") from exc
+            data = stream.read(limit + len(UTF8_BOM) + 1)
+    except OSError as exc:
+        raise ContractError("file", f"The {label} file is unavailable.") from exc
+    offset = len(UTF8_BOM) if data.startswith(UTF8_BOM) else 0
+    if len(data) - offset > limit:
+        raise ContractError("file_limit", f"The {label} file is larger than the {limit:,}-byte limit.", [{"code": "file_bytes", "limit": limit}])
+    try:
+        return data[offset:].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContractError("file", f"The {label} file is not valid UTF-8: invalid byte sequence at byte offset {offset + exc.start:,}.") from None
+
+
+def read_html(path: Path) -> str:
+    with_bom = MAX_HTML + len(UTF8_BOM)
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(with_bom + 1)
+    except OSError as exc:
+        raise ContractError("file", "The HTML file is unavailable.") from exc
+    if len(data) > with_bom:
+        raise html_bytes_error()
+    return decode_html(data)
 
 
 def main(argv=None):
@@ -35,11 +51,11 @@ def main(argv=None):
             command.add_argument("--refresh-seconds", type=int, default=60)
     args = parser.parse_args(argv)
     try:
-        rules = load_rules(read_text(args.rules, MAX_RULES))
-        demo_html = read_text(ROOT / "data" / "catalog.html", MAX_HTML)
-        demo_rules = load_rules(read_text(ROOT / "data" / "rules.json", MAX_RULES))
+        rules = load_rules(read_text(args.rules, MAX_RULES, "rules"))
+        demo_html = read_html(ROOT / "data" / "catalog.html")
+        demo_rules = load_rules(read_text(ROOT / "data" / "rules.json", MAX_RULES, "rules"))
         if args.command == "preview":
-            html = read_text(args.source or ROOT / "data" / "catalog.html", MAX_HTML)
+            html = read_html(args.source or ROOT / "data" / "catalog.html")
             print(json.dumps(extract(html, rules, source_kind="local"), ensure_ascii=True, indent=2))
             return 0
         if not 1 <= args.port <= 65535:

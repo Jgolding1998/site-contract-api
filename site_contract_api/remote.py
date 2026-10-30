@@ -13,11 +13,13 @@ from datetime import datetime, timezone
 from urllib.parse import unquote, urlsplit
 from urllib.robotparser import RobotFileParser
 
-from .engine import ContractError, MAX_HTML
+from .engine import ContractError, MAX_HTML, UTF8_BOM, decode_html
 
 USER_AGENT = "SiteContractAPI/1.0"
 MIN_INTERVAL = 60
 MAX_ROBOTS = 64 * 1024
+# A leading byte-order mark is removed before the HTML byte limit applies.
+MAX_PAGE = MAX_HTML + len(UTF8_BOM)
 HTTPS_BUDGET = 10
 DNS_BUDGET = 3
 DNS_SLOT = threading.BoundedSemaphore(1)
@@ -157,8 +159,11 @@ def bounded_get(host: str, address: str, path: str, limit: int) -> tuple[int, by
         if len(response.headers.as_bytes()) > 8192 or response.getheader("Content-Encoding", "identity").lower() != "identity":
             raise RemoteError("remote_response", "Unsupported or excessive response headers.")
         declared = response.getheader("Content-Length")
-        if declared is not None and (not declared.isdigit() or len(declared) > 20 or int(declared) > limit):
-            raise RemoteError("remote_limit", "Remote response exceeds the byte limit.")
+        if declared is not None and (not declared.isdigit() or len(declared) > 20):
+            raise RemoteError("remote_response", "Remote response has an invalid Content-Length.")
+        if declared is not None and int(declared) > limit:
+            raise RemoteError("remote_limit", f"Remote response declares {int(declared):,} bytes; the limit is {limit:,} bytes.",
+                              [{"code": "remote_bytes", "limit": limit, "actual": int(declared)}])
         chunks, received = [], 0
         while True:
             remaining = HTTPS_BUDGET - (time.monotonic() - started)
@@ -174,7 +179,8 @@ def bounded_get(host: str, address: str, path: str, limit: int) -> tuple[int, by
             chunks.append(chunk)
             received += len(chunk)
             if received > limit:
-                raise RemoteError("remote_limit", "Remote response exceeds the byte limit.")
+                raise RemoteError("remote_limit", f"Remote response is larger than the {limit:,}-byte limit.",
+                                  [{"code": "remote_bytes", "limit": limit}])
         check_deadline()
         if declared is not None and received != int(declared):
             raise RemoteError("remote_response", "Remote response was incomplete.")
@@ -214,7 +220,7 @@ class RemoteSource:
         now = time.monotonic()
         if self.last_attempt is not None and now - self.last_attempt < self.interval:
             if self.last_error:
-                raise RemoteError(*self.last_error)
+                raise self._cached_error()
             return self.cached
         self.last_attempt = now
         try:
@@ -241,14 +247,19 @@ class RemoteSource:
                 raise RemoteError("robots_unavailable", "robots.txt could not be checked; remote extraction is stopped.")
             self.interval = max(self.interval, int(delay) + 1)
             time.sleep(delay)
-            status, body, content_type = bounded_get(self.host, address, self.path, MAX_HTML)
+            status, body, content_type = bounded_get(self.host, address, self.path, MAX_PAGE)
             if status != 200 or content_type.split(";", 1)[0].strip().lower() not in {"text/html", "application/xhtml+xml"}:
                 raise RemoteError("remote_response", "Expected a successful HTML response.")
-            self.cached = body.decode("utf-8-sig")
+            self.cached = decode_html(body)
             self.retrieved_at = datetime.now(timezone.utc).isoformat()
             self.last_error = None
             return self.cached
         except (ContractError, UnicodeError) as exc:
-            self.last_error = ((exc.code, exc.message) if isinstance(exc, ContractError)
-                               else ("remote_encoding", "Remote HTML must use UTF-8."))
-        raise RemoteError(*self.last_error) from None
+            # Cached failures keep only the fixed code, message and numeric issues.
+            self.last_error = ((exc.code, exc.message, tuple(tuple(issue.items()) for issue in exc.issues)) if isinstance(exc, ContractError)
+                               else ("html_encoding", "Remote HTML is not valid UTF-8.", ()))
+        raise self._cached_error() from None
+
+    def _cached_error(self) -> RemoteError:
+        code, message, issues = self.last_error
+        return RemoteError(code, message, [dict(issue) for issue in issues])

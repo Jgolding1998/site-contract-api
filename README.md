@@ -49,6 +49,12 @@ Supported selectors: tags, `*`, `.class`, `#id`, `[attribute]`, `[attribute=valu
 
 Successful responses include typed items, a source hash, a rules hash, selectors and the capture time. Contract failures return named issues and no partial items. `/api/data` returns HTTP 409 for a failed contract.
 
+Provenance also reports `content_model: "static_html_no_js"`, the analyzed byte count, the element count and the number of `script` elements. Inline scripts and hydration data still count toward the byte limit, but they are never executed or parsed as markup, so items that a page would only create in a browser are not found. `source_hash` is the SHA-256 of the analyzed text encoded as UTF-8, after one leading byte-order mark is removed. File and HTTPS sources are otherwise hashed byte for byte. The browser editor sends textarea text, and browsers normalize textarea line breaks to LF, so an editor preview can hash differently from the same file read by the CLI.
+
+### Preview requests
+
+`POST /api/preview` takes a JSON object with `rules` and exactly one of `html` (a JSON string) or `html_b64` (padded, canonical standard base64 of UTF-8 HTML, without whitespace). Sending both is rejected. JSON string escaping can make HTML up to six times larger, so a large page sent as `html` can exceed the request limit while the same page sent as `html_b64` fits. The browser editor always sends `html_b64`.
+
 CLI output uses JSON Unicode escapes so redirected results also work with Windows terminal encodings.
 
 ## Optional HTTPS source
@@ -69,4 +75,15 @@ python -m unittest discover -s tests -t . -v
 
 Tests use fictional HTML, temporary local HTTP servers and mocked remote transports. A local socket test verifies that slowly delivered response headers are interrupted. No third-party site is contacted by the test suite.
 
-Limits include 1 MB HTML, 32 KB rules, 200 items, 16 fields, eight selector steps, bounded tree/work counts, two processing slots and 16 connections. Repeated fields and nested items can exceed the output budget even with small inputs. Extraction stops early and HTTP JSON serialization is capped at 3 MiB, returning a small error instead of partial data. Remote DNS has a three-second budget and HTTPS reads have a ten-second watchdog; robots checks and crawl delays add separate bounded work. This is a loopback tool, not a production hosting platform. JavaScript sites need an authorized static capture. There is no authentication bypass, CAPTCHA solving or automatic selector repair.
+| Limit | Value |
+| --- | --- |
+| HTML (UTF-8 bytes after one optional byte-order mark) | 4,194,304 (4 MiB), for pasted, imported, local and HTTPS sources |
+| Rules | 32,768 bytes (32 KiB) |
+| Preview request body | 5,793,116 bytes: the largest `html_b64` value (5,592,412 characters), worst-case escaped rules (6 x 32 KiB) and 4 KiB of envelope |
+| Elements / nesting depth | 20,000 / 64 |
+| Attributes per element / name / value | 32 / 64 bytes / 65,536 UTF-8 bytes (64 KiB) |
+| Selector work / output | 500,000 steps / 3 MiB |
+
+`GET /api/status` publishes these limits as `limits`, and the browser reads its import and preview limits from it. Limit errors name the limit and include an `issues` entry with `code`, `limit` and, where known, `actual` (and `line` for structure limits). They contain only numbers and fixed labels, never page text, attribute values or file names. Invalid UTF-8 returns `html_encoding` with the byte offset of the first invalid sequence. Inputs over a limit are rejected, never trimmed.
+
+Other limits: 200 items, 16 fields, eight selector steps, two processing slots and 16 connections. Repeated fields and nested items can exceed the output budget even with small inputs. Extraction stops early and HTTP JSON serialization is capped at 3 MiB, returning a small error instead of partial data. Remote DNS has a three-second budget and HTTPS reads have a ten-second watchdog (responses are uncompressed, so a 4 MiB page needs roughly 3.5 Mbit/s); robots checks and crawl delays add separate bounded work. This is a loopback tool, not a production hosting platform. JavaScript sites need an authorized static capture. There is no authentication bypass, CAPTCHA solving or automatic selector repair.

@@ -12,10 +12,15 @@ import math
 import re
 from urllib.parse import urljoin, urlsplit
 
-MAX_HTML = 1024 * 1024
+MAX_HTML = 4 * 1024 * 1024
 MAX_RULES = 32 * 1024
 MAX_NODES = 20_000
 MAX_DEPTH = 64
+MAX_ATTRIBUTES = 32
+MAX_ATTRIBUTE_NAME_BYTES = 64
+MAX_ATTRIBUTE_BYTES = 64 * 1024
+UTF8_BOM = b"\xef\xbb\xbf"
+CONTENT_MODEL = "static_html_no_js"
 MAX_ITEMS = 200
 MAX_FIELDS = 16
 MAX_VALUE = 2048
@@ -90,6 +95,47 @@ class ContractError(ValueError):
         return {"ok": False, "error": self.code, "message": self.message, "issues": self.issues}
 
 
+def html_limit(kind: str, message: str, *, limit: int, **numbers: int) -> ContractError:
+    # Limit errors carry only fixed labels and numbers, never source text or names.
+    return ContractError("html_limit", message, [{"code": kind, "limit": limit, **numbers}])
+
+
+def html_bytes_error(size: int | None = None) -> ContractError:
+    if size is None:
+        return html_limit("html_bytes", f"HTML is larger than the {MAX_HTML:,}-byte UTF-8 limit.", limit=MAX_HTML)
+    return html_limit("html_bytes", f"HTML is {size:,} UTF-8 bytes; the limit is {MAX_HTML:,} bytes.", limit=MAX_HTML, actual=size)
+
+
+def decode_html(data: bytes) -> str:
+    """Strictly decode UTF-8 HTML bytes after removing one leading byte-order mark.
+
+    The size limit applies to the bytes after the mark. Invalid bytes are
+    rejected, never replaced.
+    """
+    offset = len(UTF8_BOM) if data.startswith(UTF8_BOM) else 0
+    if len(data) - offset > MAX_HTML:
+        raise html_bytes_error(len(data) - offset)
+    try:
+        return data[offset:].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        position = offset + exc.start
+        raise ContractError("html_encoding", f"HTML is not valid UTF-8: invalid byte sequence at byte offset {position:,}. Save or export the page as UTF-8.",
+                            [{"code": "invalid_utf8", "offset": position}]) from None
+
+
+def encode_html(html) -> bytes:
+    if not isinstance(html, str):
+        raise ContractError("html", "HTML must be provided as text.")
+    try:
+        data = html.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ContractError("html_encoding", f"HTML text contains an unpaired surrogate at character {exc.start:,}, so it cannot be encoded as UTF-8.",
+                            [{"code": "unpaired_surrogate", "offset": exc.start}]) from None
+    if len(data) > MAX_HTML:
+        raise html_bytes_error(len(data))
+    return data
+
+
 def json_object(pairs):
     result = {}
     for key, value in pairs:
@@ -125,6 +171,7 @@ class Document(HTMLParser):
         self.root = Node("document", {})
         self.stack = [self.root]
         self.nodes = 0
+        self.scripts = 0
 
     def _namespace(self, tag):
         parent = self.stack[-1]
@@ -171,10 +218,26 @@ class Document(HTMLParser):
                 if node.tag == "a":
                     raise ContractError("html", "Close each link before starting another; browsers split nested links.")
         self.nodes += 1
-        if self.nodes > MAX_NODES or len(self.stack) > MAX_DEPTH or len(attrs) > 32:
-            raise ContractError("html_limit", "HTML structure exceeds the node, depth or attribute limit.")
-        if any(len(key) > 64 or len(value or "") > 4096 for key, value in attrs):
-            raise ContractError("html_limit", "An HTML attribute exceeds the size limit.")
+        line = self.getpos()[0]
+        if self.nodes > MAX_NODES:
+            raise html_limit("html_elements", f"HTML has more than {MAX_NODES:,} elements (limit reached at line {line:,}).", limit=MAX_NODES, line=line)
+        if len(self.stack) > MAX_DEPTH:
+            raise html_limit("html_depth", f"HTML nesting at line {line:,} is deeper than {MAX_DEPTH} levels.", limit=MAX_DEPTH, actual=len(self.stack), line=line)
+        if len(attrs) > MAX_ATTRIBUTES:
+            raise html_limit("html_attributes", f"An HTML element at line {line:,} has {len(attrs)} attributes; the limit is {MAX_ATTRIBUTES}.", limit=MAX_ATTRIBUTES, actual=len(attrs), line=line)
+        for key, value in attrs:
+            name_size = len(key.encode("utf-8", "surrogatepass"))
+            if name_size > MAX_ATTRIBUTE_NAME_BYTES:
+                raise html_limit("html_attribute_name", f"An HTML attribute name at line {line:,} is {name_size:,} bytes; the limit is {MAX_ATTRIBUTE_NAME_BYTES} bytes.",
+                                 limit=MAX_ATTRIBUTE_NAME_BYTES, actual=name_size, line=line)
+            # Each UTF-8 character is at most four bytes, so short values skip encoding.
+            if value and len(value) * 4 > MAX_ATTRIBUTE_BYTES:
+                size = len(value.encode("utf-8", "surrogatepass"))
+                if size > MAX_ATTRIBUTE_BYTES:
+                    raise html_limit("html_attribute_bytes", f"An HTML attribute value at line {line:,} is {size:,} UTF-8 bytes; the limit is {MAX_ATTRIBUTE_BYTES:,} bytes.",
+                                     limit=MAX_ATTRIBUTE_BYTES, actual=size, line=line)
+        if namespace == "html" and tag == "script":
+            self.scripts += 1
         if len({key for key, _ in attrs}) != len(attrs):
             raise ContractError("html", "Duplicate HTML attributes are ambiguous.")
         node = Node(tag, dict((key, value or "") for key, value in attrs), self.stack[-1], ambiguous_attrs=ambiguous, namespace=namespace)
@@ -399,8 +462,10 @@ def node_text(node: Node, budget=None) -> str:
 def load_rules(value: dict | str) -> dict:
     try:
         if isinstance(value, str):
-            if len(value.encode()) > MAX_RULES:
-                raise ContractError("rules_limit", "Rules exceed 32 KB.")
+            size = len(value.encode())
+            if size > MAX_RULES:
+                raise ContractError("rules_limit", f"Rules are {size:,} UTF-8 bytes; the limit is {MAX_RULES:,} bytes.",
+                                    [{"code": "rules_bytes", "limit": MAX_RULES, "actual": size}])
             value = json.loads(value, object_pairs_hook=json_object)
         if not isinstance(value, dict) or set(value) - {"item_selector", "min_items", "max_items", "expected_items", "fields", "base_url"}:
             raise ContractError("rules", "Rules must be an object with documented keys only.")
@@ -444,7 +509,7 @@ def load_rules(value: dict | str) -> dict:
             if attribute is not None and (not isinstance(attribute, str) or not re.fullmatch(r"(?:href|src|title|alt|value|data-[a-z0-9_-]{1,40})", attribute)):
                 raise ContractError("rules", "Unsupported extraction attribute.")
         if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > MAX_RULES:
-            raise ContractError("rules_limit", "Rules exceed 32 KB.")
+            raise ContractError("rules_limit", f"Rules exceed the {MAX_RULES:,}-byte limit when serialized.", [{"code": "rules_bytes", "limit": MAX_RULES}])
         return value
     except ContractError:
         raise
@@ -479,21 +544,16 @@ def convert(raw: str, kind: str, base_url: str | None):
 
 
 def extract(html: str, rules: dict | str, *, source_kind="pasted", source_url: str | None = None, retrieved_at: str | None = None) -> dict:
-    try:
-        valid_html = isinstance(html, str) and len(html.encode("utf-8")) <= MAX_HTML
-    except UnicodeError:
-        valid_html = False
-    if not valid_html:
-        raise ContractError("html_limit", "HTML must be UTF-8 text no larger than 1 MB.")
+    data = encode_html(html)
     rules = load_rules(rules)
     parser = Document()
     try:
         parser.feed(html)
         parser.close()
-    except (RecursionError, ValueError) as exc:
+    except (RecursionError, ValueError, AssertionError) as exc:
         if isinstance(exc, ContractError):
             raise
-        raise ContractError("html", "HTML could not be parsed within the supported limits.") from exc
+        raise ContractError("html", "Malformed or unsupported HTML markup.") from None
     budget = [MAX_WORK]
     # Compile within this extraction only; rule text is never retained in a global cache.
     selectors = {selector: compile_selector(selector) for selector in
@@ -535,7 +595,11 @@ def extract(html: str, rules: dict | str, *, source_kind="pasted", source_url: s
     if issues:
         raise ContractError("schema_drift", "Required fields, cardinality or types no longer match the contract.", issues)
     canonical = json.dumps(rules, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    provenance = {"source_kind": source_kind, "source_hash": hashlib.sha256(html.encode()).hexdigest(),
+    # source_hash covers the analyzed text as UTF-8: after any byte-order mark is
+    # removed and before parsing. No other normalization is applied here.
+    provenance = {"source_kind": source_kind, "source_hash": hashlib.sha256(data).hexdigest(),
+                  "source_bytes": len(data), "content_model": CONTENT_MODEL,
+                  "html_elements": parser.nodes, "script_elements": parser.scripts,
                   "rules_hash": hashlib.sha256(canonical.encode()).hexdigest(),
                   "retrieved_at": retrieved_at or datetime.now(timezone.utc).isoformat(),
                   "item_selector": rules["item_selector"],

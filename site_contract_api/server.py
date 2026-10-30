@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from datetime import datetime, timezone
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,10 +14,23 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from .engine import ContractError, MAX_HTML, MAX_OUTPUT, extract, json_object, load_rules
+from .engine import (ContractError, MAX_ATTRIBUTE_BYTES, MAX_ATTRIBUTES, MAX_DEPTH, MAX_HTML, MAX_NODES, MAX_OUTPUT, MAX_RULES,
+                     UTF8_BOM, decode_html, extract, html_bytes_error, html_limit, json_object, load_rules)
 
 ROOT = Path(__file__).resolve().parent
-MAX_BODY = 3 * 1024 * 1024
+# Base64 grows HTML by a fixed 4/3, unlike JSON string escaping (up to 6x).
+# The body cap fits the largest html_b64 value, worst-case escaped rules text
+# and a small fixed envelope, and never drops below the earlier 3 MiB.
+MAX_HTML_B64 = 4 * -(-(MAX_HTML + len(UTF8_BOM)) // 3)
+MAX_BODY = max(3 * 1024 * 1024, MAX_HTML_B64 + 6 * MAX_RULES + 4 * 1024)
+BASE64_TEXT = re.compile(r"[A-Za-z0-9+/]*={0,2}")
+ENVELOPE_TOKEN = re.compile(r'["{}\[\],:]|[^\s"{}\[\],:]+')
+MAX_ENVELOPE_TOKENS = 2064
+MAX_ENVELOPE_DEPTH = 20
+LIMITS = {"html_bytes": MAX_HTML, "html_b64_chars": MAX_HTML_B64, "rules_bytes": MAX_RULES, "request_bytes": MAX_BODY,
+          "output_bytes": MAX_OUTPUT, "html_elements": MAX_NODES, "html_depth": MAX_DEPTH,
+          "html_attributes": MAX_ATTRIBUTES, "attribute_bytes": MAX_ATTRIBUTE_BYTES,
+          "json_tokens": MAX_ENVELOPE_TOKENS, "json_depth": MAX_ENVELOPE_DEPTH}
 HEADER_BUDGET = 10
 BODY_BUDGET = 10
 MAX_RESPONSE = MAX_OUTPUT
@@ -36,6 +51,43 @@ def encoded_response(value, limit):
             raise ContractError("output_limit", "Response output exceeds the 3 MiB limit. Use fewer items or fields.")
         chunks.append(part)
     return b"".join(chunks)
+
+
+def html_from_base64(value) -> str:
+    """Decode a canonical, padded standard-base64 UTF-8 HTML upload."""
+    if not isinstance(value, str):
+        raise ContractError("html_b64", "html_b64 must be a base64 text string.")
+    if len(value) > MAX_HTML_B64:
+        raise html_limit("html_b64_chars", f"html_b64 is {len(value):,} characters; the limit is {MAX_HTML_B64:,} characters ({MAX_HTML:,} decoded bytes).",
+                         limit=MAX_HTML_B64, actual=len(value))
+    message = "html_b64 must be padded standard base64 (A-Z, a-z, 0-9, +, /, =) without whitespace or line breaks."
+    if len(value) % 4 or not BASE64_TEXT.fullmatch(value):
+        raise ContractError("html_b64", message)
+    try:
+        data = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        raise ContractError("html_b64", message) from None
+    if base64.b64encode(data).decode("ascii") != value:
+        raise ContractError("html_b64", "html_b64 is not canonical base64; its final padding bits must be zero.")
+    return decode_html(data)
+
+
+def guard_envelope(text):
+    position, level, tokens = 0, 0, 0
+    while match := ENVELOPE_TOKEN.search(text, position):
+        tokens += 1
+        if tokens > MAX_ENVELOPE_TOKENS:
+            raise ValueError("JSON envelope has too many tokens")
+        token, position = text[match.start()], match.end()
+        if token == '"':
+            decoded, position = json.decoder.scanstring(text, position, True)
+            del decoded
+        elif token in ("[", "{"):
+            level += 1
+            if level > MAX_ENVELOPE_DEPTH:
+                raise ValueError("JSON envelope is too deep")
+        elif token in ("]", "}"):
+            level -= 1
 
 
 def csrf_cookie(header, cookie_name):
@@ -73,12 +125,12 @@ class Source:
             else:
                 try:
                     with Path(self.path).open("rb") as stream:
-                        identity = stream.read(MAX_HTML + 1)
-                    if len(identity) > MAX_HTML:
-                        raise ContractError("html_limit", "Configured source exceeds 1 MB.")
-                    html = identity.decode("utf-8-sig")
-                except (OSError, UnicodeError) as exc:
-                    raise ContractError("source", "Configured source is unavailable or is not UTF-8 text.") from exc
+                        identity = stream.read(MAX_HTML + len(UTF8_BOM) + 1)
+                    if len(identity) > MAX_HTML + len(UTF8_BOM):
+                        raise html_bytes_error()
+                    html = decode_html(identity)
+                except OSError as exc:
+                    raise ContractError("source", "Configured source is unavailable.") from exc
             rules = load_rules(self.rules)
             canonical = json.dumps(rules, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             key = (kind, url, hashlib.sha256(identity).digest(), hashlib.sha256(canonical.encode("utf-8")).digest())
@@ -278,7 +330,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/demo":
             self.send_json(200, {"html": self.server.demo_html, "rules": self.server.demo_rules})
         elif self.path == "/api/status":
-            self.send_json(200, {"mode": "configured HTTPS" if self.server.source.remote else "offline", "endpoint": "/api/data"})
+            self.send_json(200, {"mode": "configured HTTPS" if self.server.source.remote else "offline", "endpoint": "/api/data", "limits": LIMITS})
         elif self.path == "/healthz":
             self.send_json(200, {"ok": True})
         elif self.path == "/api/data":
@@ -292,7 +344,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.send_json(200, self.server.source.result())
             except ContractError as exc:
-                self.send_json(409 if exc.code == "schema_drift" else 413 if exc.code == "output_limit" else 502, exc.as_dict())
+                self.send_json(409 if exc.code == "schema_drift" else 413 if exc.code in {"output_limit", "html_limit", "rules_limit", "remote_limit"} else 502, exc.as_dict())
             finally:
                 self.server.jobs.release()
                 self.server.source_jobs.release()
@@ -311,7 +363,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = self.headers.get("Content-Length", "")
             if not re.fullmatch(r"[0-9]{1,10}", length) or int(length) > MAX_BODY:
-                self.send_json(413, {"ok": False, "error": "body_limit", "message": "A bounded Content-Length is required, up to 3 MB."})
+                issue = {"code": "request_bytes", "limit": MAX_BODY}
+                if length.isdigit() and len(length) <= 10:
+                    issue["actual"] = int(length)
+                self.send_json(413, {"ok": False, "error": "body_limit", "issues": [issue], "message":
+                    f"The request needs a Content-Length of at most {MAX_BODY:,} bytes. Escaped JSON text can be several times larger than the page: "
+                    f"send html_b64 (base64 of UTF-8 HTML up to {MAX_HTML:,} bytes) instead of html. The browser editor does this automatically."})
                 return
             if self.headers.get("Content-Type", "").lower() != "application/json":
                 self.send_json(415, {"ok": False, "error": "content_type", "message": "Expected application/json."})
@@ -327,10 +384,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError()
                 body.extend(chunk)
                 remaining -= len(chunk)
-            value = json.loads(body, object_pairs_hook=json_object)
-            if not isinstance(value, dict) or set(value) != {"html", "rules"}:
+            text = body.decode("utf-8")
+            guard_envelope(text)
+            value = json.loads(text, object_pairs_hook=json_object)
+            keys = set(value) if isinstance(value, dict) else None
+            if keys == {"html", "html_b64", "rules"}:
+                raise ContractError("html_input", "Send either html or html_b64, not both.")
+            if keys not in ({"html", "rules"}, {"html_b64", "rules"}):
                 raise ValueError()
-            self.send_json(200, extract(value["html"], value["rules"]))
+            html = value["html"] if "html" in keys else html_from_base64(value["html_b64"])
+            self.send_json(200, extract(html, value["rules"]))
         except ContractError as exc:
             self.send_json(413 if exc.code == "output_limit" else 422, exc.as_dict())
         except TimeoutError:

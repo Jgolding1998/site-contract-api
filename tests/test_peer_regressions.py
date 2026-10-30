@@ -33,7 +33,8 @@ class EngineRegressionTests(unittest.TestCase):
     def test_lone_surrogate_html_is_a_controlled_error(self):
         with self.assertRaises(engine.ContractError) as error:
             engine.extract("<a>\ud800</a>", RULES)
-        self.assertEqual(error.exception.code, "html_limit")
+        self.assertEqual(error.exception.code, "html_encoding")
+        self.assertEqual(error.exception.issues, [{"code": "unpaired_surrogate", "offset": 3}])
 
     def test_ambiguous_optional_closing_tags_fail_instead_of_merging_text(self):
         fixtures = [

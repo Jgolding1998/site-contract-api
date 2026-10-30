@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
+from site_contract_api import server
 from site_contract_api.server import Handler, Server, Source
 from .test_engine import HTML, RULES
 
@@ -228,7 +229,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request(headers={"Transfer-Encoding": "chunked"})[0], 400)
 
     def test_body_framing_size_type_and_json_limits(self):
-        self.assertEqual(self.request("POST", "/api/preview", "{}", {"Content-Length": str(4 * 1024 * 1024)})[0], 413)
+        self.assertEqual(self.request("POST", "/api/preview", "{}", {"Content-Length": str(server.MAX_BODY + 1)})[0], 413)
         self.assertEqual(self.request("POST", "/api/preview", "{}", {"Content-Type": "text/plain"})[0], 415)
         for body in ("{", "[]", '{"html":"a","html":"b","rules":{}}'):
             self.assertIn(self.request("POST", "/api/preview", body)[0], (400, 422))
