@@ -31,6 +31,32 @@ class RemoteError(ContractError):
     pass
 
 
+def _validated_robots_lines(body: bytes) -> list[str]:
+    """Reject unsupported advertised rates before version-dependent parsing.
+
+    robotparser versions differ between raising on non-ASCII digit characters
+    and ignoring the declaration. Ignoring it would let this tool fetch a page
+    despite an unsupported advertised limit, so validate every rate declaration.
+    """
+    lines = body.decode("utf-8", "replace").splitlines()
+    try:
+        for line in lines:
+            name, separator, value = line.split("#", 1)[0].strip().partition(":")
+            name = name.strip().lower()
+            if not separator or name not in {"crawl-delay", "request-rate"}:
+                continue
+            numbers = [part.strip() for part in value.strip().split("/")]
+            if len(numbers) != (2 if name == "request-rate" else 1):
+                raise ValueError()
+            if any(not number.isascii() or not number.isdigit() for number in numbers):
+                raise ValueError()
+            if name == "request-rate" and any(int(number) == 0 for number in numbers):
+                raise ValueError()
+    except (ValueError, OverflowError):
+        raise RemoteError("robots_invalid", "robots.txt contains an unsupported rate or delay.") from None
+    return lines
+
+
 def validate_target(url: str, allow_host: str) -> tuple[str, str]:
     try:
         parts = urlsplit(url)
@@ -228,9 +254,10 @@ class RemoteSource:
             status, body, _ = bounded_get(self.host, address, "/robots.txt", MAX_ROBOTS)
             delay = 1
             if status == 200:
+                lines = _validated_robots_lines(body)
                 policy = RobotFileParser()
                 try:
-                    policy.parse(body.decode("utf-8", "replace").splitlines())
+                    policy.parse(lines)
                     delay = max(delay, policy.crawl_delay(USER_AGENT) or 0)
                     rate = policy.request_rate(USER_AGENT)
                     if rate:
