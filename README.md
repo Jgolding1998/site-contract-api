@@ -65,7 +65,7 @@ Remote reads must be configured in the CLI. There is no browser URL-fetch endpoi
 python -m site_contract_api serve --remote-url https://example.org/catalog --allow-host example.org --rules rules.json
 ```
 
-Use only a source you are allowed to access. The client checks robots.txt, identifies itself as `SiteContractAPI/1.0`, caches refreshes for at least 60 seconds, validates every resolved address and pins the connection while verifying the original TLS hostname. Redirects, proxies, private destinations, credentials, query strings, dot segments, unencoded non-ASCII paths and compressed responses are unsupported. robots.txt failures stop the read; a missing robots.txt returns standard 404 handling. Long crawl delays require a local capture instead.
+Use only a source you are allowed to access. The client checks robots.txt, identifies itself as `SiteContractAPI/1.0`, caches refreshes for at least 60 seconds, validates every resolved address and pins the connection while verifying the original TLS hostname. Redirects, proxies, private destinations, credentials, query strings, dot segments, unencoded non-ASCII paths and compressed responses are unsupported. robots.txt failures stop the read; a missing robots.txt returns standard 404 handling. Explicit crawl-delay and request-rate declarations require ASCII integer fields, with positive request counts and rate periods. Unsupported declarations stop before a page request, including when a stdlib parser would ignore them. Long crawl delays require a local capture instead.
 
 ## Checks and limits
 
