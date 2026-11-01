@@ -150,6 +150,31 @@ class Source:
             return result
 
 
+def _linger_discard(request):
+    """Half-close, then discard at most 16 KiB within one 100ms deadline.
+
+    Small delayed bodies must not reset an unread early response. Discarded
+    bytes are never parsed or acted on; larger or later sends can still reset.
+    """
+    try:
+        request.shutdown(socket.SHUT_WR)
+    except OSError:
+        return
+    remaining, deadline = 16 * 1024, time.monotonic() + .1
+    while remaining:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        try:
+            request.settimeout(left)
+            block = request.recv(min(4096, remaining))
+        except OSError:
+            return
+        if not block:
+            return
+        remaining -= len(block)
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = not hasattr(socket, "SO_EXCLUSIVEADDRUSE")
@@ -169,9 +194,16 @@ class Server(ThreadingHTTPServer):
         self.jobs = threading.BoundedSemaphore(2)
         self.source_jobs = threading.BoundedSemaphore(1)
 
+    def shutdown_request(self, request):
+        # Handler.finish() has flushed any response before shared socket cleanup.
+        try:
+            _linger_discard(request)
+        finally:
+            super().shutdown_request(request)
+
     def process_request(self, request, client_address):
         if not self.connections.acquire(blocking=False):
-            request.close()
+            self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
